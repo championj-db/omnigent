@@ -53,12 +53,6 @@
         "no-restricted-globals": "off",
         "no-restricted-imports": "off"
       }
-    },
-    {
-      "files": ["electron/**"],
-      "rules": {
-        "no-restricted-globals": "off"
-      }
     }
   ],
   "ignorePatterns": [

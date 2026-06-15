@@ -34,7 +34,7 @@ from omnigent.inner.codex_executor import (
     _populate_codex_home_config,
     _provider_codex_config_overrides,
 )
-from omnigent.inner.databricks_executor import _read_databrickscfg, _read_databrickscfg_host
+from omnigent.inner.databricks_executor import _read_databrickscfg
 
 _logger = logging.getLogger(__name__)
 
@@ -1060,14 +1060,13 @@ def build_codex_native_server(
     config_overrides: list[str] = []
     if profile is not None:
         creds = _read_databrickscfg(profile)
-        host = creds.host if creds is not None else _read_databrickscfg_host(profile)
-        if not host:
+        if creds is None:
             raise OSError(
                 f"Native Codex with Databricks profile {profile!r} (from your "
                 "provider config) requires a matching ~/.databrickscfg section "
-                "with a host visible to the runner process."
+                "visible to the runner process."
             )
-        host = host.rstrip("/")
+        host = creds.host.rstrip("/")
         config_overrides.extend(
             _databricks_codex_config_overrides(
                 model=model or _DATABRICKS_CODEX_DEFAULT_MODEL,
