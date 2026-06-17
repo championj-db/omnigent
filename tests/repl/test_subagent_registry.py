@@ -302,11 +302,86 @@ async def test_clear_during_poll_wins_over_stale_seed() -> None:
             self.sessions = _ClearingSessions(target_host)
 
     client = _ClearingClient(host)
-    await _refresh_subagent_tree(client, host, "conv_old")  # type: ignore[arg-type]
+    applied = await _refresh_subagent_tree(client, host, "conv_old")  # type: ignore[arg-type]
 
+    assert applied is False  # the stale seed was dropped, reported to the caller
     assert host.has_active_subagents() is False
     assert host.subagent_tree() == []
     assert host._subagent_root is None  # not re-rooted to the cleared session
+
+
+@pytest.mark.asyncio
+async def test_dropped_seed_keeps_root_eligible_for_rediscovery() -> None:
+    """BLOCKER regression: a poll whose seed is DROPPED as stale (a clear raced
+    the BFS) must NOT mark the root discovered. Otherwise a user who lands back
+    on that same root would find ``_should_poll_subagents`` returning False
+    forever — the registry empty, ``has_active_subagents()`` false — so the
+    badge / ↓ menu would never re-appear.
+
+    This mirrors the exact bookkeeping in ``run_repl._subagent_poll_loop``
+    (``applied = await _refresh_subagents(); if applied and root unchanged:
+    discovered_root = root``) against the real host + epoch machinery: poll A,
+    clear mid-BFS, then (user back on A) poll A again and assert it bootstraps.
+    """
+    host = _host()
+
+    class _RaceOnceSessions:
+        """First ``child_sessions`` call clears the tree mid-BFS (simulating a
+        ``/switch`` landing during the poll); later calls behave normally."""
+
+        def __init__(self, target_host: TerminalHost) -> None:
+            self._host = target_host
+            self._clear_pending = True
+            self.calls: list[str] = []
+
+        async def child_sessions(
+            self, session_id: str, *, limit: int = 100
+        ) -> list[dict[str, Any]]:
+            self.calls.append(session_id)
+            if self._clear_pending:
+                self._clear_pending = False
+                self._host.clear_subagents()  # epoch bump → first seed is stale
+            return [{"id": "conv_a_child", "busy": True, "current_task_status": "in_progress"}]
+
+    class _RaceOnceClient:
+        def __init__(self, target_host: TerminalHost) -> None:
+            self.sessions = _RaceOnceSessions(target_host)
+
+    client = _RaceOnceClient(host)
+    root = "conv_a"
+    discovered_root: str | None = None  # mirrors the poll loop's tracker
+
+    # ── Round 1: A not discovered yet → poll fires, but the clear races the
+    #    BFS so the seed is dropped. The root must stay UN-discovered.
+    assert (
+        _should_poll_subagents(
+            root_id=root, has_active=host.has_active_subagents(), discovered_root=discovered_root
+        )
+        is True
+    )
+    applied = await _refresh_subagent_tree(client, host, root)  # type: ignore[arg-type]
+    if applied and host._subagent_root == root:  # the loop's exact gate
+        discovered_root = root
+    assert applied is False
+    assert discovered_root is None  # ← the fix: NOT marked discovered
+    assert host.has_active_subagents() is False  # tree was cleared
+
+    # ── Round 2: user is back on A. Because A was never marked discovered, the
+    #    poll MUST fire again — and this time (no clear) the seed applies and
+    #    the badge / ↓ menu re-populate.
+    assert (
+        _should_poll_subagents(
+            root_id=root, has_active=host.has_active_subagents(), discovered_root=discovered_root
+        )
+        is True
+    )
+    applied = await _refresh_subagent_tree(client, host, root)  # type: ignore[arg-type]
+    if applied and host._subagent_root == root:
+        discovered_root = root
+    assert applied is True
+    assert discovered_root == root
+    assert host.has_active_subagents() is True
+    assert [n.session_id for n, _ in host.subagent_tree()] == ["conv_a_child"]
 
 
 def test_run_repl_wires_subagent_plumbing() -> None:
@@ -342,6 +417,15 @@ def test_run_repl_wires_subagent_plumbing() -> None:
         "the poll loop no longer bootstraps discovery per-root — resuming / "
         "switching into a session with already-running children won't surface "
         "the badge or ↓ menu until a fresh SSE event happens to arrive."
+    )
+    # The blocker fix: discovery is only recorded when the seed actually
+    # applied. ``test_dropped_seed_keeps_root_eligible_for_rediscovery``
+    # covers the behaviour; this guards the loop's wiring of it, since the
+    # gate lives in a closure that can't be invoked in isolation.
+    assert "applied = await _refresh_subagents()" in src and "if applied and" in src, (
+        "the poll loop records discovered_root without checking whether the "
+        "seed applied — a clear racing the BFS would drop the seed yet still "
+        "mark the root discovered, so it could never be re-bootstrapped."
     )
     assert "_sync_subagent_root" in src and "_readonly_view" in src, (
         "the root-tracking dropped its read-only-view source of truth — the "

@@ -2,8 +2,9 @@
 
 While the REPL observes a running sub-agent read-only (dived in via the ↓
 menu, ``_readonly_view`` set), the plain-message send path is already refused.
-Mutating slash-commands must be refused too — running them would unbind or
-mutate the *viewed* child, the exact thing read-only view exists to prevent:
+Slash-commands must be refused too — unless they're on a small allowlist of
+navigational / read-only commands — because anything else either unbinds /
+mutates / cancels the *viewed* child or posts a turn into it:
 
 * ``/switch`` -> ``switch_to_session()`` unbinds the child + clears the view
 * ``/new`` / ``/clear`` -> ``start_new_conversation()`` does the same
@@ -11,10 +12,12 @@ mutate the *viewed* child, the exact thing read-only view exists to prevent:
 * ``/model`` / ``/effort`` -> PATCH settings onto the viewed child's session
 * ``/compact`` -> posts a compaction turn into the child's conversation
 * ``/cancel`` -> cancels the child's in-flight response
+* skill slash-commands (registered at runtime) -> ``send_skill_slash_command``
+  posts a turn into the session
 
-Navigational / read-only commands (``/help`` etc.) must still work.
-
-Uses the same stub-and-capture pattern as ``test_repl_fork_command.py``.
+The guard is an ALLOWLIST so it stays complete as commands are added (and so it
+covers the dynamically-registered skill commands a static denylist couldn't
+name). Uses the same stub-and-capture pattern as ``test_repl_fork_command.py``.
 """
 
 from __future__ import annotations
@@ -23,11 +26,31 @@ from io import StringIO
 
 import pytest
 
-from omnigent.repl import _repl as repl_mod
-from omnigent.repl._repl import _READONLY_BLOCKED_COMMANDS, handle_slash_command
+from omnigent.repl._repl import (
+    _READONLY_ALLOWED_COMMANDS,
+    COMMANDS,
+    handle_slash_command,
+    register_skill_commands,
+    unregister_skill_commands,
+)
+from omnigent.spec.types import SkillSpec
 
 # ``asyncio_mode = "auto"`` (pyproject) collects the async tests below without
-# an explicit marker, so the sync ``test_blocked_set_*`` stays unmarked.
+# an explicit marker, so the sync ``test_*`` helpers stay unmarked.
+
+# Built-in commands that mutate / unbind / cancel the viewed child's session.
+# Kept explicit here (rather than imported) so the test pins the *intended*
+# behaviour independently of the production allowlist.
+_KNOWN_MUTATING_COMMANDS = (
+    "/switch",
+    "/new",
+    "/clear",
+    "/fork",
+    "/model",
+    "/effort",
+    "/compact",
+    "/cancel",
+)
 
 
 # ── Stubs ────────────────────────────────────────────────
@@ -66,6 +89,15 @@ class _RecordingSession:
     async def cancel(self) -> None:
         self.calls.append("cancel")
 
+    def send_skill_slash_command(self, name: str, arg: str) -> object:
+        self.calls.append(("send_skill_slash_command", name, arg))
+
+        async def _gen():  # pragma: no cover - should never run while blocked
+            if False:
+                yield None
+
+        return _gen()
+
 
 class _CapturingHost:
     """Host stub that records ``output()`` calls and renders them to text."""
@@ -76,19 +108,28 @@ class _CapturingHost:
     def output(self, item: object) -> None:
         self.outputs.append(item)
 
+    def start_timer(self) -> None:  # used by the skill handler
+        self.outputs.append("<start_timer>")
+
     def render_plain(self) -> str:
         from rich.console import Console
 
         buf = StringIO()
         console = Console(file=buf, force_terminal=False, width=200, color_system=None)
         for item in self.outputs:
-            console.print(item)
+            if isinstance(item, str):
+                console.print(item)
+            else:
+                console.print(item)
         return buf.getvalue()
 
 
 class _StubFmt:
     muted = "dim"
     accent = "bold"
+
+    def user_message(self, text: str) -> str:
+        return f"<user:{text}>"
 
 
 class _ExplodingSessionsNamespace:
@@ -107,27 +148,27 @@ class _StubClient:
 # ── Tests ────────────────────────────────────────────────
 
 
-def test_blocked_set_covers_every_named_mutating_command() -> None:
-    """The denylist must contain every command that unbinds / mutates the
-    viewed child. A regression that drops one would silently re-open the hole."""
-    assert _READONLY_BLOCKED_COMMANDS.issuperset(
-        {
-            "/switch",
-            "/new",
-            "/clear",
-            "/fork",
-            "/model",
-            "/effort",
-            "/compact",
-            "/cancel",
-        }
+def test_allowlist_is_all_real_navigational_commands() -> None:
+    """Every allowlisted name is a registered command (no typos), and the
+    allowlist contains none of the known mutating commands."""
+    for cmd in _READONLY_ALLOWED_COMMANDS:
+        assert cmd in COMMANDS, f"{cmd} is allowlisted but not a registered command"
+    assert not (_READONLY_ALLOWED_COMMANDS & set(_KNOWN_MUTATING_COMMANDS)), (
+        "a mutating command leaked onto the read-only allowlist"
     )
-    # Every blocked command is a real registered command (no typos).
-    for cmd in _READONLY_BLOCKED_COMMANDS:
-        assert cmd in repl_mod.COMMANDS, f"{cmd} is blocked but not a registered command"
 
 
-@pytest.mark.parametrize("cmd", sorted(_READONLY_BLOCKED_COMMANDS))
+def test_every_registered_command_is_allowlisted_or_blocked() -> None:
+    """Completeness: in read-only view, every registered command is either on
+    the allowlist or refused. Proves no built-in mutator slips through and
+    documents the closure — a denylist couldn't make this guarantee."""
+    assert _READONLY_ALLOWED_COMMANDS.issubset(set(COMMANDS)), "stale allowlist entry"
+    # The known mutators must all be OFF the allowlist (i.e. blocked).
+    for cmd in _KNOWN_MUTATING_COMMANDS:
+        assert cmd not in _READONLY_ALLOWED_COMMANDS, f"{cmd} must be blocked in read-only view"
+
+
+@pytest.mark.parametrize("cmd", _KNOWN_MUTATING_COMMANDS)
 async def test_mutating_command_blocked_in_readonly_view(cmd: str) -> None:
     """In read-only view, each mutating command is refused: the session is
     never touched and the user is told to press ← first."""
@@ -142,9 +183,50 @@ async def test_mutating_command_blocked_in_readonly_view(cmd: str) -> None:
     assert session.calls == [], (
         f"{cmd} mutated/unbound the viewed child in read-only view: {session.calls}"
     )
-    out = host.render_plain().lower()
-    assert "read-only view" in out
-    assert "←" in host.render_plain()
+    out = host.render_plain()
+    assert "read-only view" in out.lower()
+    assert "←" in out
+
+
+async def test_skill_command_blocked_in_readonly_view() -> None:
+    """A dynamically-registered skill slash-command posts a turn into the
+    viewed child via ``send_skill_slash_command`` — it must be refused in
+    read-only view. This is the hole a static denylist could not have covered."""
+    registered = register_skill_commands(
+        [SkillSpec(name="code-review", description="Review the diff", content="")]
+    )
+    try:
+        assert "/code-review" in COMMANDS  # sanity: it really registered
+        assert "/code-review" not in _READONLY_ALLOWED_COMMANDS
+
+        session = _RecordingSession(readonly=True)
+        host = _CapturingHost()
+        await handle_slash_command("/code-review do it", session, _StubClient(), host, _StubFmt())
+
+        assert session.calls == [], (
+            f"skill command posted a turn into the viewed child: {session.calls}"
+        )
+        assert "read-only view" in host.render_plain().lower()
+    finally:
+        unregister_skill_commands(registered)
+
+
+async def test_navigational_command_allowed_in_readonly_view() -> None:
+    """Allowlisted read-only / navigational commands are NOT blocked while
+    observing a sub-agent — they don't touch the child. ``/help`` is a safe,
+    observable representative (it lists the registered commands); the rest of
+    the allowlist is covered by ``test_every_registered_command_is_allowlisted
+    _or_blocked`` without invoking side-effecting handlers like ``/quit`` or
+    ``/report``."""
+    session = _RecordingSession(readonly=True)
+    host = _CapturingHost()
+
+    await handle_slash_command("/help", session, _StubClient(), host, _StubFmt())
+
+    out = host.render_plain()
+    assert "read-only view" not in out.lower()
+    assert "/switch" in out  # /help dispatched and listed commands
+    assert session.calls == []  # navigational commands never mutate the child
 
 
 async def test_mutating_command_runs_when_not_in_readonly_view() -> None:
@@ -162,16 +244,17 @@ async def test_mutating_command_runs_when_not_in_readonly_view() -> None:
     assert "cannot compact while a response is running" in out
 
 
-async def test_navigational_command_allowed_in_readonly_view() -> None:
-    """Read-only / navigational commands (``/help``) stay available while
-    observing a sub-agent — they don't touch the child."""
+async def test_unknown_command_not_reported_as_readonly_block() -> None:
+    """A typo'd command in read-only view still gets the 'unknown command'
+    message — the guard only fires for *registered* commands, so it never
+    masks an unknown-command error."""
     session = _RecordingSession(readonly=True)
     host = _CapturingHost()
 
-    await handle_slash_command("/help", session, _StubClient(), host, _StubFmt())
+    await handle_slash_command(
+        "/definitely-not-a-command", session, _StubClient(), host, _StubFmt()
+    )
 
-    out = host.render_plain()
-    assert "read-only view" not in out.lower()
-    # /help lists registered commands.
-    assert "/switch" in out
-    assert session.calls == []
+    out = host.render_plain().lower()
+    assert "read-only view" not in out
+    assert "unknown command" in out

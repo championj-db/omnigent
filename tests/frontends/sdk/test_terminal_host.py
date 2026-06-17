@@ -1397,6 +1397,26 @@ def test_clear_subagents_empties_the_tree() -> None:
     assert host.subagent_tree() == []
 
 
+def test_upsert_after_clear_does_not_reroot_tree() -> None:
+    """The SSE/upsert path (``upsert_subagent``) must never re-root a cleared
+    tree. ``seed_subagent_tree`` is the only re-root path and it's epoch-guarded;
+    ``upsert_subagent`` only adds/merges nodes, so an event landing just after a
+    clear can't resurrect the old session as the root. (Confirms non-blocking
+    review point #2: no async producer re-roots a cleared tree without an epoch.)"""
+    host = TerminalHost(model_name="test")
+    host.seed_subagent_tree(
+        "conv_old",
+        [{"id": "conv_old_child", "parent_id": "conv_old", **_busy()}],
+    )
+    assert host._subagent_root == "conv_old"
+    host.clear_subagents()
+    assert host._subagent_root is None
+    # A late SSE event for the old session arrives after the clear.
+    host.upsert_subagent("conv_late", parent_id="conv_old", child=_busy())
+    # The tree root stays cleared — upsert never re-roots.
+    assert host._subagent_root is None
+
+
 def test_clear_subagents_bumps_epoch() -> None:
     """Each clear advances the generation counter so an in-flight tree refresh
     can detect that it raced a clear and drop its stale seed."""
@@ -1413,11 +1433,12 @@ def test_seed_subagent_tree_current_epoch_applies() -> None:
     applied normally — the guard only drops *stale* snapshots."""
     host = TerminalHost(model_name="test")
     epoch = host.subagent_epoch()
-    host.seed_subagent_tree(
+    applied = host.seed_subagent_tree(
         "conv_main",
         [{"id": "conv_child", "parent_id": "conv_main", **_busy()}],
         expected_epoch=epoch,
     )
+    assert applied is True  # seed applied -> caller can mark root discovered
     assert host.active_subagent_count() == 1
     assert [n.session_id for n, _ in host.subagent_tree()] == ["conv_child"]
 
@@ -1435,11 +1456,12 @@ def test_seed_subagent_tree_stale_epoch_is_dropped() -> None:
     host.clear_subagents()
     assert host.has_active_subagents() is False
     # The stale snapshot lands afterward — it must be dropped, not re-rooted.
-    host.seed_subagent_tree(
+    applied = host.seed_subagent_tree(
         "conv_old",
         [{"id": "conv_old_child", "parent_id": "conv_old", **_busy()}],
         expected_epoch=epoch,
     )
+    assert applied is False  # dropped -> caller must NOT mark root discovered
     assert host.has_active_subagents() is False
     assert host.subagent_tree() == []
     assert host._subagent_root is None
@@ -1450,10 +1472,11 @@ def test_seed_subagent_tree_without_epoch_always_applies() -> None:
     callers that don't participate in the race protocol."""
     host = TerminalHost(model_name="test")
     host.clear_subagents()  # bump the epoch off zero
-    host.seed_subagent_tree(
+    applied = host.seed_subagent_tree(
         "conv_main",
         [{"id": "conv_child", "parent_id": "conv_main", **_busy()}],
     )
+    assert applied is True
     assert [n.session_id for n, _ in host.subagent_tree()] == ["conv_child"]
 
 

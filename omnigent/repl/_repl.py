@@ -3707,11 +3707,14 @@ async def run_repl(
         if not getattr(session, "_readonly_view", False) and session.session_id is not None:
             subagent_root[0] = session.session_id
 
-    async def _refresh_subagents() -> None:
+    async def _refresh_subagents() -> bool:
+        # Returns whether the tree was actually (re)seeded — False when there's
+        # no root, or when the seed was dropped as stale because a clear raced
+        # the BFS. The poll loop keys discovery bookkeeping on this.
         root_id = subagent_root[0]
         if root_id is None:
-            return
-        await _refresh_subagent_tree(client, host, root_id)
+            return False
+        return await _refresh_subagent_tree(client, host, root_id)
 
     # The root we've already run an initial discovery poll against. Lets the
     # loop fetch the tree ONCE for each new root even when the local registry
@@ -3741,8 +3744,15 @@ async def run_repl(
                     has_active=host.has_active_subagents(),
                     discovered_root=discovered_root[0],
                 ):
-                    await _refresh_subagents()
-                    discovered_root[0] = root_id
+                    applied = await _refresh_subagents()
+                    # Only record the root as discovered when the seed actually
+                    # landed AND the live root still matches the one we polled.
+                    # If a ``/switch`` / ``/new`` cleared the tree mid-BFS the
+                    # seed is dropped (``applied`` False) — leaving the root
+                    # eligible for re-discovery on the next tick, so a user who
+                    # lands back on it still gets the badge/menu bootstrapped.
+                    if applied and subagent_root[0] == root_id:
+                        discovered_root[0] = root_id
             except asyncio.CancelledError:
                 raise
             except Exception:  # noqa: BLE001 — best-effort background poll; never crash the REPL
@@ -5781,7 +5791,7 @@ async def _refresh_subagent_tree(
     root_id: str,
     *,
     max_depth: int = _MAX_SUBAGENT_TREE_DEPTH,
-) -> None:
+) -> bool:
     """Recursively fetch the sub-agent tree under *root_id* and push it into
     the host registry.
 
@@ -5790,6 +5800,11 @@ async def _refresh_subagent_tree(
     each row with the parent it was queried under so the host can reconstruct
     the hierarchy. The SSE stream only delivers the active session's direct
     children, so this poll is what keeps grandchildren live.
+
+    :returns: ``True`` if the fetched snapshot was actually seeded into the
+        host; ``False`` if it was dropped as stale because a ``clear_subagents``
+        (``/switch`` / ``/new``) bumped the epoch mid-BFS. The poll loop uses
+        this to avoid marking a root 'discovered' off a dropped seed.
     """
     # Capture the tree generation BEFORE the await-heavy BFS below. If a
     # ``/switch`` / ``/new`` calls ``clear_subagents`` while we're mid-fetch,
@@ -5818,7 +5833,7 @@ async def _refresh_subagent_tree(
                 next_frontier.append(sid)
         frontier = next_frontier
         depth += 1
-    host.seed_subagent_tree(root_id, nodes, expected_epoch=epoch)
+    return host.seed_subagent_tree(root_id, nodes, expected_epoch=epoch)
 
 
 async def _collect_overview_targets(
@@ -7629,19 +7644,21 @@ def _render_history_item(
 # same handler — ``/help`` already lists the canonical names.
 _SLASH_COMMAND_ALIASES: frozenset[str] = frozenset({"/?", "/exit"})
 
-# Slash commands refused while observing a sub-agent read-only (dived in via
-# the ↓ menu). Each of these would unbind or mutate the *viewed* child — the
-# exact thing read-only view exists to prevent:
-#   /switch        -> switch_to_session(): unbinds the child + clears the view
-#   /new, /clear   -> start_new_conversation(): unbinds the child + clears the view
-#   /fork          -> forks + re-points off the child, leaving the view inconsistent
-#   /model, /effort-> PATCH settings onto the viewed child's session
-#   /compact       -> posts a compaction turn into the child's conversation
-#   /cancel        -> cancels the child's in-flight response
-# Read-only / navigational commands (/help, /theme, /history, /context, /logs,
-# /report, /quit, …) stay available; press ← to leave the view first.
-_READONLY_BLOCKED_COMMANDS: frozenset[str] = frozenset(
-    {"/switch", "/new", "/clear", "/fork", "/model", "/effort", "/compact", "/cancel"}
+# Slash commands SAFE to run while observing a sub-agent read-only (dived in
+# via the ↓ menu): they don't unbind, mutate, cancel, or post a turn to the
+# *viewed* child. This is an allowlist, NOT a denylist, deliberately: EVERY
+# other registered command is refused in read-only view — both mutating
+# built-ins (/switch & /new & /clear unbind the child; /model & /effort PATCH
+# its session; /compact & /cancel mutate its turn; /fork re-points off it) AND
+# dynamically-registered skill slash-commands (which call
+# ``send_skill_slash_command`` → post a turn into the session). A denylist
+# couldn't name the skill commands (registered at runtime), so allow-by-name
+# is the only complete guard. Anything added later defaults to blocked-in-view
+# until explicitly added here — the safe direction for "don't touch the child".
+#   allowed: /help (+ /? alias), /theme, /history, /context, /logs, /report,
+#            /quit (+ /exit alias) — all read-only / navigational w.r.t. the child.
+_READONLY_ALLOWED_COMMANDS: frozenset[str] = frozenset(
+    {"/help", "/?", "/theme", "/history", "/context", "/logs", "/report", "/quit", "/exit"}
 )
 
 
@@ -7790,12 +7807,18 @@ async def handle_slash_command(
     cmd = parts[0].lower()
     arg = parts[1].strip() if len(parts) > 1 else ""
 
-    # While observing a sub-agent read-only (dived in via ↓), refuse commands
-    # that would unbind or mutate the viewed child — the message-send path is
-    # already guarded, but mutating slash-commands bypass it. Navigational /
-    # read-only commands stay available; press ← to return to the main session
-    # before running these.
-    if cmd in _READONLY_BLOCKED_COMMANDS and getattr(session, "_readonly_view", False):
+    # While observing a sub-agent read-only (dived in via ↓), refuse any
+    # registered command that isn't on the read-only allowlist — these would
+    # unbind / mutate / cancel the viewed child or post a turn into it (the
+    # message-send path is already guarded, but slash-commands bypass it).
+    # Gating on ``cmd in COMMANDS`` keeps the "unknown command" message intact
+    # for typos. Navigational / read-only commands stay available; press ← to
+    # return to the main session first.
+    if (
+        getattr(session, "_readonly_view", False)
+        and cmd in COMMANDS
+        and cmd not in _READONLY_ALLOWED_COMMANDS
+    ):
         host.output(
             Text.from_markup(
                 f"   [{fmt.muted}]read-only view — press ← to return to the main "

@@ -3147,7 +3147,7 @@ class TerminalHost:
         nodes: list[dict[str, Any]],
         *,
         expected_epoch: int | None = None,
-    ) -> None:
+    ) -> bool:
         """Replace the tree from a recursively-fetched snapshot.
 
         Each entry in ``nodes`` is a ``child_sessions`` row augmented with a
@@ -3164,9 +3164,13 @@ class TerminalHost:
             by :meth:`clear_subagents` (a ``/switch`` / ``/new`` raced this
             poll's BFS), the snapshot is stale — drop it and leave the cleared
             tree in place rather than re-rooting to the old session.
+        :returns: ``True`` if the snapshot was applied; ``False`` if it was
+            dropped as stale (epoch mismatch). Callers use this to avoid
+            treating a dropped seed as a completed discovery — a dropped root
+            must stay eligible for re-discovery on the next poll.
         """
         if expected_epoch is not None and expected_epoch != self._subagent_epoch:
-            return
+            return False
         self._subagent_root = root_id
         seen: set[str] = {root_id}
         for row in nodes:
@@ -3192,6 +3196,7 @@ class TerminalHost:
             if (now - node.done_at) >= _SUBAGENT_LINGER_SECONDS:
                 del self._subagents[sid]
         self._invalidate_prompt()
+        return True
 
     def _subagent_visible(self, node: _SubagentNode, now: float) -> bool:
         """Whether a node shows in the badge count + ↓ menu.
