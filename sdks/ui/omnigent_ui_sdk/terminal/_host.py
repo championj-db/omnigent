@@ -894,6 +894,13 @@ class TerminalHost:
         # the tree is rooted at (the originally-launched "main" session).
         self._subagents: dict[str, _SubagentNode] = {}
         self._subagent_root: str | None = None
+        # Monotonic generation counter bumped by :meth:`clear_subagents`.
+        # A tree refresh captures the epoch before its await-heavy BFS and
+        # passes it back to :meth:`seed_subagent_tree`; if a ``/switch`` /
+        # ``/new`` cleared the tree mid-poll (bumping this), the stale seed
+        # is dropped so the cleared tree wins rather than being re-rooted to
+        # the old session.
+        self._subagent_epoch: int = 0
         # Inline ``↓`` sub-agents menu state. Open is toggled by Down (on an
         # empty input while sub-agents are active) / Esc; index + scroll
         # drive the windowed list rendered below the toolbar (see the layout
@@ -3125,7 +3132,22 @@ class TerminalHost:
             node.done_at = None
         self._invalidate_prompt()
 
-    def seed_subagent_tree(self, root_id: str, nodes: list[dict[str, Any]]) -> None:
+    def subagent_epoch(self) -> int:
+        """Current sub-agent tree generation (see :attr:`_subagent_epoch`).
+
+        Capture this before an await-heavy tree refresh and hand it back to
+        :meth:`seed_subagent_tree` as ``expected_epoch`` so a clear that lands
+        mid-refresh wins over the stale seed.
+        """
+        return self._subagent_epoch
+
+    def seed_subagent_tree(
+        self,
+        root_id: str,
+        nodes: list[dict[str, Any]],
+        *,
+        expected_epoch: int | None = None,
+    ) -> None:
         """Replace the tree from a recursively-fetched snapshot.
 
         Each entry in ``nodes`` is a ``child_sessions`` row augmented with a
@@ -3137,7 +3159,14 @@ class TerminalHost:
         absent from the snapshot (e.g. a poll racing a just-spawned child).
         A sub-agent that HAS sent its response (terminal status) is dropped
         once it has both left the snapshot and outlived its linger window.
+
+        :param expected_epoch: If provided and the epoch has since been bumped
+            by :meth:`clear_subagents` (a ``/switch`` / ``/new`` raced this
+            poll's BFS), the snapshot is stale — drop it and leave the cleared
+            tree in place rather than re-rooting to the old session.
         """
+        if expected_epoch is not None and expected_epoch != self._subagent_epoch:
+            return
         self._subagent_root = root_id
         seen: set[str] = {root_id}
         for row in nodes:
@@ -3244,6 +3273,10 @@ class TerminalHost:
         session's sub-agents don't linger under the new one."""
         self._subagents.clear()
         self._subagent_root = None
+        # Bump the generation so any tree refresh whose BFS started before this
+        # clear no-ops at its ``seed_subagent_tree`` instead of re-seeding the
+        # just-cleared tree from the old session's children.
+        self._subagent_epoch += 1
         self._invalidate_prompt()
 
     def _is_inside_subagent(self) -> bool:

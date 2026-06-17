@@ -1397,6 +1397,66 @@ def test_clear_subagents_empties_the_tree() -> None:
     assert host.subagent_tree() == []
 
 
+def test_clear_subagents_bumps_epoch() -> None:
+    """Each clear advances the generation counter so an in-flight tree refresh
+    can detect that it raced a clear and drop its stale seed."""
+    host = TerminalHost(model_name="test")
+    before = host.subagent_epoch()
+    host.clear_subagents()
+    assert host.subagent_epoch() == before + 1
+    host.clear_subagents()
+    assert host.subagent_epoch() == before + 2
+
+
+def test_seed_subagent_tree_current_epoch_applies() -> None:
+    """A seed whose captured epoch still matches (no intervening clear) is
+    applied normally — the guard only drops *stale* snapshots."""
+    host = TerminalHost(model_name="test")
+    epoch = host.subagent_epoch()
+    host.seed_subagent_tree(
+        "conv_main",
+        [{"id": "conv_child", "parent_id": "conv_main", **_busy()}],
+        expected_epoch=epoch,
+    )
+    assert host.active_subagent_count() == 1
+    assert [n.session_id for n, _ in host.subagent_tree()] == ["conv_child"]
+
+
+def test_seed_subagent_tree_stale_epoch_is_dropped() -> None:
+    """A refresh that captured its epoch before a ``clear_subagents`` (a
+    ``/switch`` / ``/new`` racing the poll's BFS) must NOT re-seed the
+    just-cleared tree — the clear wins, so the prior session's running
+    children don't stick in the badge forever."""
+    host = TerminalHost(model_name="test")
+    host.upsert_subagent("conv_old_child", parent_id="conv_old", child=_busy())
+    # A poll begins: it captured the epoch before its (awaited) BFS.
+    epoch = host.subagent_epoch()
+    # Mid-BFS, /switch clears the tree and will re-root elsewhere.
+    host.clear_subagents()
+    assert host.has_active_subagents() is False
+    # The stale snapshot lands afterward — it must be dropped, not re-rooted.
+    host.seed_subagent_tree(
+        "conv_old",
+        [{"id": "conv_old_child", "parent_id": "conv_old", **_busy()}],
+        expected_epoch=epoch,
+    )
+    assert host.has_active_subagents() is False
+    assert host.subagent_tree() == []
+    assert host._subagent_root is None
+
+
+def test_seed_subagent_tree_without_epoch_always_applies() -> None:
+    """``expected_epoch=None`` (the default) keeps the unguarded behaviour for
+    callers that don't participate in the race protocol."""
+    host = TerminalHost(model_name="test")
+    host.clear_subagents()  # bump the epoch off zero
+    host.seed_subagent_tree(
+        "conv_main",
+        [{"id": "conv_child", "parent_id": "conv_main", **_busy()}],
+    )
+    assert [n.session_id for n, _ in host.subagent_tree()] == ["conv_child"]
+
+
 # ── Inline ↓ sub-agents menu ───────────────────────────────────────
 
 

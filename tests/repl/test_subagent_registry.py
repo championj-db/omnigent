@@ -24,7 +24,11 @@ import pytest
 from omnigent_ui_sdk.terminal._host import TerminalHost
 
 from omnigent.repl import _repl
-from omnigent.repl._repl import _apply_child_session_event, _refresh_subagent_tree
+from omnigent.repl._repl import (
+    _apply_child_session_event,
+    _refresh_subagent_tree,
+    _should_poll_subagents,
+)
 from omnigent.server.schemas import (
     SessionChildSessionUpdatedEvent,
     SessionCreatedEvent,
@@ -205,6 +209,106 @@ async def test_refresh_subagent_tree_respects_depth_cap() -> None:
     assert "c1" not in client.sessions.calls  # never recursed into c1
 
 
+# ── Fix 1: empty-registry bootstrap on resume / switch ─────────────
+
+
+def test_should_poll_skips_when_no_root() -> None:
+    """No tree root (before any session is known) -> never poll."""
+    assert _should_poll_subagents(root_id=None, has_active=False, discovered_root=None) is False
+    assert _should_poll_subagents(root_id=None, has_active=True, discovered_root=None) is False
+
+
+def test_should_poll_bootstraps_empty_registry_for_new_root() -> None:
+    """The regression fix: a new root whose children are already running emits
+    no fresh SSE event, so the registry is empty and ``has_active`` is false.
+    Discovery must still fire (once) so the badge / ↓ menu appears — gating on
+    ``has_active`` alone would never poll ``child_sessions``."""
+    assert (
+        _should_poll_subagents(root_id="conv_main", has_active=False, discovered_root=None)
+        is True
+    )
+    # Switching to a *different* root re-triggers discovery for the new one.
+    assert (
+        _should_poll_subagents(
+            root_id="conv_new", has_active=False, discovered_root="conv_old"
+        )
+        is True
+    )
+
+
+def test_should_poll_steady_state_is_cheap_once_discovered() -> None:
+    """After the initial discovery for a root, an idle (no active sub-agents)
+    tick does NOT re-poll — steady state stays I/O-free."""
+    assert (
+        _should_poll_subagents(
+            root_id="conv_main", has_active=False, discovered_root="conv_main"
+        )
+        is False
+    )
+    # But while sub-agents are active we keep polling to refresh nested levels.
+    assert (
+        _should_poll_subagents(
+            root_id="conv_main", has_active=True, discovered_root="conv_main"
+        )
+        is True
+    )
+
+
+@pytest.mark.asyncio
+async def test_refresh_discovers_into_empty_registry() -> None:
+    """End-to-end of the bootstrap: with an empty registry, a single refresh
+    against a root with already-running children populates the badge/menu —
+    no prior SSE event required."""
+    client = _FakeClient(
+        {"conv_main": [{"id": "conv_c1", "tool": "coder", "busy": True,
+                        "current_task_status": "in_progress"}]}
+    )
+    host = _host()
+    assert host.has_active_subagents() is False  # empty to start
+    await _refresh_subagent_tree(client, host, "conv_main")  # type: ignore[arg-type]
+    assert host.has_active_subagents() is True
+    assert [n.session_id for n, _ in host.subagent_tree()] == ["conv_c1"]
+
+
+# ── Fix 3: clear-during-poll epoch guard ───────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_clear_during_poll_wins_over_stale_seed() -> None:
+    """If ``clear_subagents`` lands while the refresh BFS is awaiting
+    ``child_sessions`` (a ``/switch`` / ``/new`` racing the poll), the stale
+    seed at the end no-ops — the clear wins and the old session's children
+    don't stick in the 'N agents running' badge forever."""
+    host = _host()
+
+    class _ClearingSessions:
+        def __init__(self, target_host: TerminalHost) -> None:
+            self._host = target_host
+            self.calls: list[str] = []
+
+        async def child_sessions(
+            self, session_id: str, *, limit: int = 100
+        ) -> list[dict[str, Any]]:
+            self.calls.append(session_id)
+            # Simulate /switch clearing the tree mid-poll — between the epoch
+            # capture at the top of _refresh_subagent_tree and its final seed.
+            self._host.clear_subagents()
+            return [
+                {"id": "conv_old_child", "busy": True, "current_task_status": "in_progress"}
+            ]
+
+    class _ClearingClient:
+        def __init__(self, target_host: TerminalHost) -> None:
+            self.sessions = _ClearingSessions(target_host)
+
+    client = _ClearingClient(host)
+    await _refresh_subagent_tree(client, host, "conv_old")  # type: ignore[arg-type]
+
+    assert host.has_active_subagents() is False
+    assert host.subagent_tree() == []
+    assert host._subagent_root is None  # not re-rooted to the cleared session
+
+
 def test_run_repl_wires_subagent_plumbing() -> None:
     """Source-inspection guard: ``run_repl`` must wire the event hook, the
     inline-menu select callback (switching sessions), and the poll task.
@@ -233,6 +337,11 @@ def test_run_repl_wires_subagent_plumbing() -> None:
     )
     assert "_subagent_poll_loop" in src, (
         "the background tree poll (deeper levels) is no longer started"
+    )
+    assert "_should_poll_subagents(" in src and "discovered_root" in src, (
+        "the poll loop no longer bootstraps discovery per-root — resuming / "
+        "switching into a session with already-running children won't surface "
+        "the badge or ↓ menu until a fresh SSE event happens to arrive."
     )
     assert "_sync_subagent_root" in src and "_readonly_view" in src, (
         "the root-tracking dropped its read-only-view source of truth — the "
