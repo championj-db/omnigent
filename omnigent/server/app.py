@@ -24,6 +24,7 @@ from omnigent.native_coding_agents import (
     CODEX_NATIVE_CODING_AGENT,
     PI_NATIVE_CODING_AGENT,
 )
+from omnigent.onboarding.cursor_auth import CURSOR_DEFAULT_TEMPLATE_NAME
 from omnigent.resources import examples as _examples_resources
 from omnigent.runtime import (
     get_terminal_registry,
@@ -78,6 +79,7 @@ _CODEX_NATIVE_AGENT_NAME = CODEX_NATIVE_CODING_AGENT.agent_name
 _PI_NATIVE_AGENT_NAME = PI_NATIVE_CODING_AGENT.agent_name
 _DEBBY_AGENT_NAME = "debby"
 _POLLY_AGENT_NAME = "polly"
+_CURSOR_DEFAULT_AGENT_NAME = CURSOR_DEFAULT_TEMPLATE_NAME
 _UNMATCHED_ROUTE_TEMPLATE = "<unmatched>"
 # polly's and debby's multi-file bundles are packaged under
 # omnigent.resources.examples (see pyproject package-data), so they resolve
@@ -352,6 +354,7 @@ def _ensure_default_agents(
     _ensure_default_pi_agent(agent_store, artifact_store, agent_cache)
     _ensure_default_debby_agent(agent_store, artifact_store, agent_cache)
     _ensure_default_polly_agent(agent_store, artifact_store, agent_cache)
+    _ensure_default_cursor_agent(agent_store, artifact_store, agent_cache)
     _ensure_extra_builtin_agents(agent_store, artifact_store, agent_cache)
 
 
@@ -666,6 +669,66 @@ def _ensure_default_polly_agent(
         agent_cache,
         name=_POLLY_AGENT_NAME,
         bundle_bytes=_build_polly_bundle(),
+    )
+
+
+def _build_cursor_default_bundle() -> bytes:
+    """
+    Build a gzipped tarball of the cursor launch-template agent spec.
+
+    The spec is generated (single-file, like the native-UI builds) by
+    :func:`omnigent.onboarding.cursor_auth.materialize_cursor_template_spec`
+    rather than packaged as a directory.
+
+    :returns: Gzipped tarball bytes suitable for the artifact store.
+    """
+    import tempfile
+
+    from omnigent.onboarding.cursor_auth import materialize_cursor_template_spec
+    from omnigent.spec import materialize_bundle
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        spec_path = materialize_cursor_template_spec(Path(tmpdir))
+        bundle_dir = materialize_bundle(spec_path, Path(tmpdir) / "bundle")
+        return _tar_gz_dir(bundle_dir)
+
+
+def _ensure_default_cursor_agent(
+    agent_store: AgentStore,
+    artifact_store: ArtifactStore,
+    agent_cache: Any,
+) -> None:
+    """
+    Register or refresh the cursor launch template — only when a key is set.
+
+    Gated on :func:`omnigent.onboarding.cursor_auth.cursor_api_key_configured`
+    so it ties to the ``omnigent setup`` flow for adding/validating a
+    ``CURSOR_API_KEY``: configuring the key is what makes this template
+    appear (it would be a dead card otherwise, since the cursor harness can't
+    run without the SDK's required key). When no key is configured this is a
+    no-op, so deployments and users that never touch Cursor see no new agent
+    and the other built-in seeders are unaffected.
+
+    Idempotent and content-aware via :func:`_ensure_builtin_agent`: a second
+    boot with the same spec creates no duplicate, and a wheel that changes the
+    template refreshes the existing row in place.
+
+    :param agent_store: Store for agent metadata.
+    :param artifact_store: Store for agent bundles.
+    :param agent_cache: Cache for loaded agent specs.
+    """
+    from omnigent.onboarding.cursor_auth import cursor_api_key_configured
+
+    if not cursor_api_key_configured():
+        _logger.debug("No Cursor API key configured; skipping cursor template seed")
+        return
+
+    _ensure_builtin_agent(
+        agent_store,
+        artifact_store,
+        agent_cache,
+        name=_CURSOR_DEFAULT_AGENT_NAME,
+        bundle_bytes=_build_cursor_default_bundle(),
     )
 
 

@@ -550,6 +550,105 @@ def test_ensure_default_polly_agent_is_idempotent(seed_stores: _SeedStores) -> N
     assert polly_rows[0].version == first.version == 1
 
 
+def test_ensure_default_cursor_agent_seeds_when_key_configured(
+    seed_stores: _SeedStores, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    With a Cursor API key configured, the launch template is seeded.
+
+    The ``omnigent setup`` flow for adding/validating a ``CURSOR_API_KEY``
+    is what flips :func:`cursor_api_key_configured` to ``True``; the seeder
+    then registers ``cursor-default-v1`` as a built-in the picker can render
+    as a launchable Cursor card. Patches the source function the seeder
+    imports lazily so the test never touches the real config.
+    """
+    monkeypatch.setattr(
+        "omnigent.onboarding.cursor_auth.cursor_api_key_configured", lambda *a, **k: True
+    )
+
+    server_app._ensure_default_cursor_agent(
+        seed_stores.agent_store,
+        seed_stores.artifact_store,
+        seed_stores.agent_cache,
+    )
+
+    seeded = seed_stores.agent_store.get_by_name(server_app._CURSOR_DEFAULT_AGENT_NAME)
+    assert seeded is not None, "cursor template was not registered"
+    assert seeded.name == "cursor-default-v1"
+    assert seeded.session_id is None, "built-in template must be session-scope NULL"
+    # The bundle must be retrievable, not just referenced.
+    assert seed_stores.artifact_store.get(seeded.bundle_location) is not None
+
+
+def test_ensure_default_cursor_agent_is_idempotent(
+    seed_stores: _SeedStores, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    A second seed call with the key configured is a no-op — no duplicate.
+
+    Startup runs the seeder every boot; a non-idempotent seeder would
+    accumulate a new ``cursor-default-v1`` row on each restart and break the
+    unique-name invariant. The content-addressed bundle is deterministic, so
+    the re-seed must not bump the version either.
+    """
+    monkeypatch.setattr(
+        "omnigent.onboarding.cursor_auth.cursor_api_key_configured", lambda *a, **k: True
+    )
+
+    server_app._ensure_default_cursor_agent(
+        seed_stores.agent_store,
+        seed_stores.artifact_store,
+        seed_stores.agent_cache,
+    )
+    first = seed_stores.agent_store.get_by_name(server_app._CURSOR_DEFAULT_AGENT_NAME)
+    assert first is not None
+    server_app._ensure_default_cursor_agent(
+        seed_stores.agent_store,
+        seed_stores.artifact_store,
+        seed_stores.agent_cache,
+    )
+
+    page = seed_stores.agent_store.list(limit=100)
+    cursor_rows = [a for a in page.data if a.name == "cursor-default-v1"]
+    assert len(cursor_rows) == 1
+    assert cursor_rows[0].id == first.id
+    assert cursor_rows[0].version == first.version == 1
+
+
+def test_ensure_default_cursor_agent_skips_without_key_and_spares_siblings(
+    seed_stores: _SeedStores, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    With no Cursor key configured, no cursor template — and no side effects.
+
+    A deployment or user that never touches Cursor must not get a dead card
+    for an agent the harness can't run without its required key. The gate is
+    a clean no-op: it neither registers the cursor template nor disturbs the
+    other built-in seeders, which keep working in the same store.
+    """
+    monkeypatch.setattr(
+        "omnigent.onboarding.cursor_auth.cursor_api_key_configured", lambda *a, **k: False
+    )
+
+    server_app._ensure_default_cursor_agent(
+        seed_stores.agent_store,
+        seed_stores.artifact_store,
+        seed_stores.agent_cache,
+    )
+    assert seed_stores.agent_store.get_by_name(server_app._CURSOR_DEFAULT_AGENT_NAME) is None
+
+    # A non-cursor seeder still works in the same store — proving the gate
+    # produced no side effects on the rest of the setup flow.
+    server_app._ensure_default_polly_agent(
+        seed_stores.agent_store,
+        seed_stores.artifact_store,
+        seed_stores.agent_cache,
+    )
+    assert seed_stores.agent_store.get_by_name(server_app._POLLY_AGENT_NAME) is not None
+    # Still no cursor row after the sibling seed.
+    assert seed_stores.agent_store.get_by_name(server_app._CURSOR_DEFAULT_AGENT_NAME) is None
+
+
 def test_ensure_default_polly_agent_refreshes_on_spec_change(
     seed_stores: _SeedStores, polly_src_copy: Path
 ) -> None:

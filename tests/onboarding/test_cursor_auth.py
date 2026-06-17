@@ -18,11 +18,13 @@ import yaml
 
 from omnigent.onboarding import secrets as secret_store
 from omnigent.onboarding.cursor_auth import (
+    CURSOR_DEFAULT_TEMPLATE_NAME,
     CURSOR_SECRET_NAME,
     cursor_api_key_configured,
     cursor_api_key_ref,
     cursor_api_key_settings,
     looks_like_cursor_api_key,
+    materialize_cursor_template_spec,
     resolve_cursor_api_key,
 )
 
@@ -106,3 +108,26 @@ def test_settings_shape() -> None:
     assert cursor_api_key_settings("keychain:cursor") == {
         "cursor": {"api_key_ref": "keychain:cursor"}
     }
+
+
+def test_materialize_cursor_template_spec(tmp_path: Path) -> None:
+    """The launch template materializes to a valid, loadable cursor spec.
+
+    It carries the versioned default name and wraps the ``cursor`` harness, so
+    the server's seeder can register it as a built-in once a key is configured.
+    """
+    from omnigent.spec import load, materialize_bundle
+
+    spec_path = materialize_cursor_template_spec(tmp_path)
+    assert spec_path.name == f"{CURSOR_DEFAULT_TEMPLATE_NAME}.yaml"
+
+    raw = yaml.safe_load(spec_path.read_text())
+    assert raw["name"] == CURSOR_DEFAULT_TEMPLATE_NAME
+    assert raw["executor"] == {"harness": "cursor"}
+    # No model is pinned — the cursor wrap resolves an unset model to "auto".
+    assert "model" not in raw["executor"]
+
+    # The generated spec must load through the real spec pipeline.
+    bundle_dir = materialize_bundle(spec_path, tmp_path / "bundle")
+    spec = load(bundle_dir)
+    assert spec.name == CURSOR_DEFAULT_TEMPLATE_NAME

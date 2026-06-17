@@ -26,12 +26,22 @@ there would be mis-consumed by claude-sdk / codex / pi / openai-agents.
 
 from __future__ import annotations
 
+from pathlib import Path
+from typing import Any
+
 from omnigent.errors import OmnigentError
 from omnigent.onboarding.provider_config import load_config, resolve_secret
 
 # The secret-store name (and thus ``keychain:<name>``) under which a Cursor
 # API key is stored — stable so the setup flow and the resolver agree.
 CURSOR_SECRET_NAME = "cursor"
+
+# Name of the built-in launch template seeded when a Cursor API key is
+# configured (see :func:`omnigent.server.app._ensure_default_cursor_agent`).
+# Versioned (``-v1``) so a future template shape can ship under a new name
+# without colliding with — or silently mutating — an existing seeded row; the
+# name is the agent_store's unique key, so it must stay stable across boots.
+CURSOR_DEFAULT_TEMPLATE_NAME = "cursor-default-v1"
 
 # The dedicated top-level config block and the field that references the key.
 CURSOR_CONFIG_KEY = "cursor"
@@ -126,3 +136,40 @@ def cursor_api_key_settings(ref: str) -> dict[str, object]:
     :returns: ``{"cursor": {"api_key_ref": ref}}``.
     """
     return {CURSOR_CONFIG_KEY: {_API_KEY_REF_FIELD: ref}}
+
+
+def materialize_cursor_template_spec(tmpdir: Path) -> Path:
+    """Write the built-in cursor launch-template agent spec.
+
+    Mirrors :func:`omnigent.pi_native._materialize_pi_agent_spec`: a minimal,
+    single-file spec wrapping the ``cursor`` harness so the Web UI's
+    new-session picker can offer a ready-to-launch Cursor card once a
+    ``CURSOR_API_KEY`` has been registered through ``omnigent setup``. No
+    ``model`` is pinned — the cursor wrap resolves an unset model to cursor's
+    ``auto`` select (see :mod:`omnigent.inner.cursor_harness`), and no auth
+    block is declared because the SDK reads the key from the spawn env rather
+    than the gateway ``auth:`` block (see
+    :func:`omnigent.runtime.workflow._build_cursor_spawn_env`).
+
+    :param tmpdir: Temporary directory for the generated YAML file.
+    :returns: Path to the generated YAML spec.
+    """
+    import yaml
+
+    yaml_path = tmpdir / f"{CURSOR_DEFAULT_TEMPLATE_NAME}.yaml"
+    raw: dict[str, Any] = {
+        "name": CURSOR_DEFAULT_TEMPLATE_NAME,
+        "prompt": (
+            "You are a Cursor coding agent. Use the available tools to read, "
+            "write, and run code in the working directory to complete the "
+            "user's request."
+        ),
+        "executor": {"harness": "cursor"},
+        "os_env": {
+            "type": "caller_process",
+            "cwd": ".",
+            "sandbox": {"type": "none"},
+        },
+    }
+    yaml_path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+    return yaml_path
