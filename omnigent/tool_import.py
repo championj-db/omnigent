@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import tomllib
 import yaml
@@ -509,7 +510,12 @@ def _render_mcp_yaml(
         if server.url is None:
             raw["url"] = None
         else:
-            raw["url"] = server.url
+            raw["url"] = _externalize_url(
+                server.name,
+                server.url,
+                env_example,
+                warnings=warnings,
+            )
         if server.headers:
             raw["headers"] = _externalize_secret_mapping(
                 server.name,
@@ -564,6 +570,63 @@ def _externalize_secret_mapping(
                 "--force does not copy values that look like credentials."
             )
     return rendered
+
+
+def _externalize_url(
+    server_name: str,
+    url: str,
+    env_example: dict[str, str],
+    *,
+    warnings: list[str],
+) -> str:
+    split = urlsplit(url)
+    if split.username or split.password or _secret_fragment(split.fragment):
+        env_name = f"MCP_{_env_name(server_name)}_URL"
+        env_example.setdefault(env_name, "")
+        warnings.append(
+            f"MCP server {server_name!r} has a secret-looking URL; externalized "
+            f"the whole URL to ${{{env_name}}}."
+        )
+        return f"${{{env_name}}}"
+
+    query = parse_qsl(split.query, keep_blank_values=True)
+    if not query:
+        return url
+    changed = False
+    rendered_query: list[tuple[str, str]] = []
+    for key, value in query:
+        env_refs = _embedded_env_refs(value)
+        if env_refs:
+            for ref in env_refs:
+                env_example.setdefault(ref, "")
+            rendered_query.append((key, _normalize_env_reference_value(value)))
+            continue
+        if _SECRET_KEY_RE.search(key) or _SECRET_VALUE_RE.match(value):
+            env_name = f"MCP_{_env_name(server_name)}_{_env_name(key)}"
+            env_example.setdefault(env_name, "")
+            rendered_query.append((key, f"${{{env_name}}}"))
+            changed = True
+            continue
+        rendered_query.append((key, value))
+    if not changed:
+        return url
+    warnings.append(
+        f"MCP server {server_name!r} has secret-looking URL query parameters; "
+        "externalized them to environment variables."
+    )
+    return urlunsplit(
+        (
+            split.scheme,
+            split.netloc,
+            split.path,
+            urlencode(rendered_query, doseq=True, safe="${}"),
+            split.fragment,
+        )
+    )
+
+
+def _secret_fragment(fragment: str) -> bool:
+    return bool(fragment and _SECRET_VALUE_RE.match(fragment))
 
 
 def _externalize_args(
