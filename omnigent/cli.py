@@ -3815,6 +3815,14 @@ def _prompt_import_conflict(rel: str, target: Path) -> str:
     is_flag=True,
     help="Allow preserving non-secret literal header/env values instead of externalizing them.",
 )
+@click.option(
+    "--mode",
+    type=click.Choice(["inline", "directory"]),
+    default="inline",
+    show_default=True,
+    help="MCP layout: 'inline' writes servers into config.yaml's tools block; "
+    "'directory' writes one tools/mcp/<name>.yaml file per server.",
+)
 def tool_import_claude(
     from_dir: Path | None,
     into: Path,
@@ -3824,6 +3832,7 @@ def tool_import_claude(
     check_only: bool,
     on_conflict: str | None,
     force: bool,
+    mode: str,
 ) -> None:
     """Import Claude Code MCP servers and skills."""
     _run_tool_import_command(
@@ -3836,6 +3845,7 @@ def tool_import_claude(
         check_only=check_only,
         on_conflict=on_conflict,
         force=force,
+        mode=mode,
     )
 
 
@@ -3869,6 +3879,14 @@ def tool_import_claude(
     is_flag=True,
     help="Allow preserving non-secret literal header/env values instead of externalizing them.",
 )
+@click.option(
+    "--mode",
+    type=click.Choice(["inline", "directory"]),
+    default="inline",
+    show_default=True,
+    help="MCP layout: 'inline' writes servers into config.yaml's tools block; "
+    "'directory' writes one tools/mcp/<name>.yaml file per server.",
+)
 def tool_import_codex(
     from_dir: Path | None,
     into: Path,
@@ -3878,6 +3896,7 @@ def tool_import_codex(
     check_only: bool,
     on_conflict: str | None,
     force: bool,
+    mode: str,
 ) -> None:
     """Import Codex MCP servers and skills."""
     _run_tool_import_command(
@@ -3890,6 +3909,7 @@ def tool_import_codex(
         check_only=check_only,
         on_conflict=on_conflict,
         force=force,
+        mode=mode,
     )
 
 
@@ -3923,6 +3943,14 @@ def tool_import_codex(
     is_flag=True,
     help="Allow preserving non-secret literal header/env values instead of externalizing them.",
 )
+@click.option(
+    "--mode",
+    type=click.Choice(["inline", "directory"]),
+    default="inline",
+    show_default=True,
+    help="MCP layout: 'inline' writes servers into config.yaml's tools block; "
+    "'directory' writes one tools/mcp/<name>.yaml file per server.",
+)
 def tool_import_cursor(
     from_dir: Path | None,
     into: Path,
@@ -3932,6 +3960,7 @@ def tool_import_cursor(
     check_only: bool,
     on_conflict: str | None,
     force: bool,
+    mode: str,
 ) -> None:
     """Import Cursor MCP servers and skills."""
     _run_tool_import_command(
@@ -3944,6 +3973,7 @@ def tool_import_cursor(
         check_only=check_only,
         on_conflict=on_conflict,
         force=force,
+        mode=mode,
     )
 
 
@@ -3977,6 +4007,14 @@ def tool_import_cursor(
     is_flag=True,
     help="Allow preserving non-secret literal header/env values instead of externalizing them.",
 )
+@click.option(
+    "--mode",
+    type=click.Choice(["inline", "directory"]),
+    default="inline",
+    show_default=True,
+    help="MCP layout: 'inline' writes servers into config.yaml's tools block; "
+    "'directory' writes one tools/mcp/<name>.yaml file per server.",
+)
 def tool_import_pi(
     from_dir: Path | None,
     into: Path,
@@ -3986,6 +4024,7 @@ def tool_import_pi(
     check_only: bool,
     on_conflict: str | None,
     force: bool,
+    mode: str,
 ) -> None:
     """Import Pi MCP servers and skills from an explicitly supplied directory."""
     _run_tool_import_command(
@@ -3998,6 +4037,7 @@ def tool_import_pi(
         check_only=check_only,
         on_conflict=on_conflict,
         force=force,
+        mode=mode,
     )
 
 
@@ -4012,17 +4052,18 @@ def _run_tool_import_command(
     check_only: bool,
     on_conflict: str | None,
     force: bool,
+    mode: str,
 ) -> None:
     """
     Shared implementation for ``omnigent tool import <source>`` commands.
     """
+    from omnigent.errors import OmnigentError
     from omnigent.tool_import import (
         apply_import_plan,
         check_import_drift,
         default_conflict_mode,
         plan_import,
     )
-    from omnigent.errors import OmnigentError
 
     try:
         if check_only:
@@ -4047,6 +4088,7 @@ def _run_tool_import_command(
             import_skills=import_skills,
             dry_run=dry_run,
             on_conflict=conflict_mode,
+            mode=cast(Any, mode),
             force=force,
             prompt_resolver=_prompt_import_conflict if conflict_mode == "prompt" else None,
         )

@@ -25,6 +25,7 @@ from omnigent.spec import load as load_spec
 ImportSource = Literal["claude", "codex", "cursor", "pi"]
 ConflictMode = Literal["fail", "skip", "overwrite", "prompt"]
 ImportKind = Literal["mcp", "skill", "scaffold", "env", "provenance"]
+LayoutMode = Literal["inline", "directory"]
 
 _ENV_REF_RE = re.compile(r"^\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?$")
 _EMBEDDED_ENV_REF_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)")
@@ -111,10 +112,25 @@ def plan_import(
     import_skills: bool,
     dry_run: bool,
     on_conflict: ConflictMode,
+    mode: LayoutMode = "inline",
     force: bool = False,
     prompt_resolver: PromptResolver | None = None,
 ) -> ImportPlan:
-    """Build an import plan and validate it against the existing parser."""
+    """
+    Build an import plan and validate it against the existing parser.
+
+    *mode* controls how MCP servers are materialized:
+
+    - ``"inline"`` (default) writes each server into the top-level
+      ``tools:`` block of ``config.yaml`` as a ``type: mcp`` entry,
+      matching the documented agent-YAML layout.
+    - ``"directory"`` writes each server to its own
+      ``tools/mcp/<name>.yaml`` file.
+
+    Both layouts are first-class to the spec parser; the choice only
+    affects on-disk shape. Skill, ``.env.example``, and provenance
+    handling are identical in both modes.
+    """
 
     if source == "pi" and source_dir is None:
         raise OmnigentError(
@@ -130,26 +146,70 @@ def plan_import(
     artifacts: list[PlannedArtifact] = []
     env_example: dict[str, str] = {}
 
-    if not (into / "config.yaml").exists():
-        artifacts.extend(_scaffold_artifacts(source, into, on_conflict, prompt_resolver))
+    need_scaffold = not (into / "config.yaml").exists()
 
+    # ── MCP discovery ────────────────────────────────
+    # In directory mode each server becomes its own file; in inline
+    # mode servers are accumulated and merged into config.yaml below.
+    inline_servers: dict[str, object] = {}
+    mcp_file_artifacts: list[PlannedArtifact] = []
     if import_mcp:
         servers = _discover_mcp_servers(source, resolved_source_dir, warnings)
         if not servers:
             warnings.append(f"No MCP servers found in {resolved_source_dir}.")
         for server in servers:
-            content = _render_mcp_yaml(server, env_example, force=force, warnings=warnings)
-            rel = f"tools/mcp/{server.name}.yaml"
-            artifacts.append(
-                _planned_file(
-                    into,
-                    rel,
-                    content,
-                    kind="mcp",
-                    on_conflict=on_conflict,
-                    prompt_resolver=prompt_resolver,
+            if mode == "directory":
+                content = _render_mcp_yaml(server, env_example, force=force, warnings=warnings)
+                mcp_file_artifacts.append(
+                    _planned_file(
+                        into,
+                        f"tools/mcp/{server.name}.yaml",
+                        content,
+                        kind="mcp",
+                        on_conflict=on_conflict,
+                        prompt_resolver=prompt_resolver,
+                    )
                 )
+            else:
+                inline_servers[server.name] = _render_inline_mcp_entry(
+                    server, env_example, force=force, warnings=warnings
+                )
+
+    # ── config.yaml (scaffold and/or inline tools merge) ──
+    if need_scaffold or inline_servers:
+        base = _scaffold_config_dict(source, into) if need_scaffold else _load_config_dict(into)
+        if inline_servers:
+            if not need_scaffold:
+                warnings.append(
+                    "Merging inline MCP servers into an existing config.yaml; "
+                    "comments and formatting in that file are not preserved."
+                )
+            existing_tools = base.get("tools")
+            base["tools"] = _merge_inline_tools(
+                existing_tools if isinstance(existing_tools, dict) else {},
+                inline_servers,
+                into=into,
+                on_conflict=on_conflict,
+                prompt_resolver=prompt_resolver,
             )
+        artifacts.append(
+            _planned_file(
+                into,
+                "config.yaml",
+                yaml.safe_dump(base, sort_keys=False),
+                kind="scaffold" if need_scaffold else "mcp",
+                # A fresh scaffold honours --on-conflict; an additive
+                # inline merge has already resolved per-server conflicts,
+                # so the rewrite itself is safe to apply.
+                on_conflict=on_conflict if need_scaffold else "overwrite",
+                prompt_resolver=prompt_resolver,
+            )
+        )
+
+    if need_scaffold:
+        artifacts.append(_scaffold_agents_md(source, into, on_conflict, prompt_resolver))
+
+    artifacts.extend(mcp_file_artifacts)
 
     if import_skills:
         skills = _discover_skill_dirs(source, resolved_source_dir)
@@ -539,6 +599,47 @@ def _render_mcp_yaml(
     return yaml.safe_dump(raw, sort_keys=False)
 
 
+def _render_inline_mcp_entry(
+    server: _McpServer,
+    env_example: dict[str, str],
+    *,
+    force: bool,
+    warnings: list[str],
+) -> dict[str, object]:
+    """
+    Render one server as an inline ``type: mcp`` ``tools:`` entry.
+
+    The inline form omits the explicit ``transport`` field — the parser
+    infers it from ``command`` (stdio) vs ``url`` (http) — and uses the
+    mapping key as the server name. Secret externalization is shared
+    with the per-file renderer.
+    """
+
+    entry: dict[str, object] = {"type": "mcp"}
+    if server.description:
+        entry["description"] = server.description
+    if server.transport == "http":
+        if server.url is not None:
+            entry["url"] = _externalize_url(
+                server.name, server.url, env_example, warnings=warnings
+            )
+        if server.headers:
+            entry["headers"] = _externalize_secret_mapping(
+                server.name, server.headers, env_example, force=force, warnings=warnings
+            )
+    else:
+        entry["command"] = server.command
+        if server.args:
+            entry["args"] = _externalize_args(server, env_example, warnings=warnings)
+        if server.env:
+            entry["env"] = _externalize_secret_mapping(
+                server.name, server.env, env_example, force=force, warnings=warnings
+            )
+    if server.timeout is not None:
+        entry["timeout"] = server.timeout
+    return entry
+
+
 def _externalize_secret_mapping(
     server_name: str,
     values: Mapping[str, str],
@@ -701,12 +802,9 @@ def _discover_skill_dirs(source: ImportSource, source_dir: Path) -> list[Path]:
     return list(skills.values())
 
 
-def _scaffold_artifacts(
-    source: ImportSource,
-    into: Path,
-    on_conflict: ConflictMode,
-    prompt_resolver: PromptResolver | None,
-) -> list[PlannedArtifact]:
+def _scaffold_config_dict(source: ImportSource, into: Path) -> dict[str, object]:
+    """Build the default ``config.yaml`` mapping for a new bundle."""
+
     name = _safe_name(into.name or "imported-agent")
     harness = {
         "claude": "claude-sdk",
@@ -714,38 +812,82 @@ def _scaffold_artifacts(
         "cursor": "cursor",
         "pi": "pi",
     }[source]
-    config = yaml.safe_dump(
-        {
-            "spec_version": 1,
-            "name": name,
-            "description": f"Imported {source} MCP servers and skills.",
-            "executor": {"type": "omnigent", "config": {"harness": harness}},
-            "instructions": "AGENTS.md",
-        },
-        sort_keys=False,
-    )
+    return {
+        "spec_version": 1,
+        "name": name,
+        "description": f"Imported {source} MCP servers and skills.",
+        "executor": {"type": "omnigent", "config": {"harness": harness}},
+        "instructions": "AGENTS.md",
+    }
+
+
+def _load_config_dict(into: Path) -> dict[str, object]:
+    """Load an existing ``config.yaml`` mapping for inline merging."""
+
+    config_path = into / "config.yaml"
+    raw = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    if not isinstance(raw, dict):
+        raise OmnigentError(
+            f"config.yaml is not a mapping: {config_path}",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    return raw
+
+
+def _scaffold_agents_md(
+    source: ImportSource,
+    into: Path,
+    on_conflict: ConflictMode,
+    prompt_resolver: PromptResolver | None,
+) -> PlannedArtifact:
+    name = _safe_name(into.name or "imported-agent")
     prompt = (
         f"You are {name}, an Omnigent agent with imported {source} tools and skills.\n\n"
         "Use the bundled MCP servers and skills when they are relevant to the task.\n"
     )
-    return [
-        _planned_file(
-            into,
-            "config.yaml",
-            config,
-            kind="scaffold",
-            on_conflict=on_conflict,
-            prompt_resolver=prompt_resolver,
-        ),
-        _planned_file(
-            into,
-            "AGENTS.md",
-            prompt,
-            kind="scaffold",
-            on_conflict=on_conflict,
-            prompt_resolver=prompt_resolver,
-        ),
-    ]
+    return _planned_file(
+        into,
+        "AGENTS.md",
+        prompt,
+        kind="scaffold",
+        on_conflict=on_conflict,
+        prompt_resolver=prompt_resolver,
+    )
+
+
+def _merge_inline_tools(
+    existing_tools: Mapping[str, object],
+    new_servers: Mapping[str, object],
+    *,
+    into: Path,
+    on_conflict: ConflictMode,
+    prompt_resolver: PromptResolver | None,
+) -> dict[str, object]:
+    """
+    Merge inline ``type: mcp`` entries into an existing ``tools:`` block.
+
+    New server names are added unconditionally. A name that already
+    exists with different content is resolved via *on_conflict* at
+    server granularity (``skip`` keeps the existing entry, ``overwrite``
+    replaces it, ``fail`` raises, ``prompt`` asks).
+    """
+
+    merged: dict[str, object] = dict(existing_tools)
+    for name, entry in new_servers.items():
+        if name in merged and merged[name] != entry:
+            resolved = _resolve_conflict(
+                on_conflict, f"config.yaml#tools.{name}", into / "config.yaml", prompt_resolver
+            )
+            if resolved == "skip":
+                continue
+            if resolved == "fail":
+                raise OmnigentError(
+                    f"Inline MCP server {name!r} already exists in config.yaml tools block: "
+                    f"{into / 'config.yaml'}",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+        merged[name] = entry
+    return merged
 
 
 def _planned_file(
