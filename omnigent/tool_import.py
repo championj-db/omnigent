@@ -1,4 +1,4 @@
-"""Import native harness MCP servers and skills into Omnigent bundles."""
+"""Import vendor MCP server configs and skills into Omnigent bundles."""
 
 from __future__ import annotations
 
@@ -71,7 +71,7 @@ class ImportPlan:
 
 @dataclass(frozen=True)
 class DriftResult:
-    """Result of ``omnigent agent import <source> --check``."""
+    """Result of ``omnigent tool import <source> --check``."""
 
     imports_path: Path
     missing: list[str]
@@ -89,7 +89,7 @@ PromptResolver = Callable[[str, Path], ConflictMode]
 
 
 def default_source_dir(source: ImportSource) -> Path:
-    """Return the default native config directory for *source*."""
+    """Return the default vendor config directory for *source*."""
 
     if source == "claude":
         return Path.home() / ".claude"
@@ -709,23 +709,23 @@ def _scaffold_artifacts(
 ) -> list[PlannedArtifact]:
     name = _safe_name(into.name or "imported-agent")
     harness = {
-        "claude": "claude-native",
-        "codex": "codex-native",
-        "cursor": "cursor-native",
+        "claude": "claude-sdk",
+        "codex": "codex",
+        "cursor": "cursor",
         "pi": "pi",
     }[source]
     config = yaml.safe_dump(
         {
             "spec_version": 1,
             "name": name,
-            "description": f"Imported {source} harness assets.",
+            "description": f"Imported {source} MCP servers and skills.",
             "executor": {"type": "omnigent", "config": {"harness": harness}},
             "instructions": "AGENTS.md",
         },
         sort_keys=False,
     )
     prompt = (
-        f"You are {name}, an Omnigent agent with imported {source} harness assets.\n\n"
+        f"You are {name}, an Omnigent agent with imported {source} tools and skills.\n\n"
         "Use the bundled MCP servers and skills when they are relevant to the task.\n"
     )
     return [

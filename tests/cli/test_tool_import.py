@@ -1,4 +1,4 @@
-"""Tests for ``omnigent agent import``."""
+"""Tests for ``omnigent tool import``."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ import pytest
 import yaml
 from click.testing import CliRunner
 
-from omnigent.agent_import import (
+from omnigent.tool_import import (
     apply_import_plan,
     check_import_drift,
     plan_import,
@@ -350,6 +350,7 @@ def test_import_skills_copies_skill_directories_without_config_skills_field(
     assert (into / "skills" / "triage" / "SKILL.md").is_file()
     config = yaml.safe_load((into / "config.yaml").read_text())
     assert "skills" not in config
+    assert config["executor"]["config"]["harness"] == "cursor"
 
 
 def test_dry_run_writes_nothing(tmp_path: Path) -> None:
@@ -407,8 +408,8 @@ def test_check_reports_drift(tmp_path: Path) -> None:
     assert result.changed == ["tools/mcp/search.yaml"]
 
 
-def test_cli_agent_import_claude_dry_run(tmp_path: Path) -> None:
-    """Click command exposes the requested ``agent import`` shape."""
+def test_cli_tool_import_claude_dry_run(tmp_path: Path) -> None:
+    """Click command exposes the requested ``tool import`` shape."""
     claude_dir = tmp_path / ".claude"
     claude_dir.mkdir()
     (tmp_path / ".claude.json").write_text(
@@ -419,7 +420,7 @@ def test_cli_agent_import_claude_dry_run(tmp_path: Path) -> None:
     result = CliRunner().invoke(
         cli,
         [
-            "agent",
+            "tool",
             "import",
             "claude",
             "--from",
@@ -434,6 +435,13 @@ def test_cli_agent_import_claude_dry_run(tmp_path: Path) -> None:
     assert result.exit_code == 0, result.output
     assert "Would write tools/mcp/search.yaml" in result.output
     assert "Dry run complete" in result.output
+
+
+def test_tool_import_replaces_removed_agent_command() -> None:
+    """The branch-added import command lives under ``tool``, not ``agent``."""
+    assert "tool" in cli.commands
+    assert "agent" not in cli.commands
+    assert "import" in cli.commands["tool"].commands
 
 
 def test_pi_requires_explicit_source_dir(tmp_path: Path) -> None:

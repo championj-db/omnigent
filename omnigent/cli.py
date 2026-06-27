@@ -1179,7 +1179,6 @@ _CLICK_SUBCOMMANDS: frozenset[str] = frozenset(
     {
         "antigravity",
         "attach",
-        "agent",
         "claude",
         "codex",
         "config",
@@ -1205,6 +1204,7 @@ _CLICK_SUBCOMMANDS: frozenset[str] = frozenset(
         "server",
         "setup",
         "stop",
+        "tool",
         "update",
         "upgrade",
         "version",
@@ -3755,14 +3755,14 @@ def upgrade(check_only: bool, force: bool, pre: bool) -> None:
 cli.add_command(upgrade, name="update")
 
 
-@cli.group()
-def agent() -> None:
-    """Manage local Omnigent agent bundles."""
+@cli.group(name="tool")
+def tool() -> None:
+    """Manage local Omnigent tool assets."""
 
 
-@agent.group(name="import")
-def agent_import() -> None:
-    """Import native harness assets into an Omnigent bundle."""
+@tool.group(name="import")
+def tool_import() -> None:
+    """Import MCP server configs and skills into an Omnigent bundle."""
 
 
 def _prompt_import_conflict(rel: str, target: Path) -> str:
@@ -3785,13 +3785,13 @@ def _prompt_import_conflict(rel: str, target: Path) -> str:
     )
 
 
-@agent_import.command(name="claude")
+@tool_import.command(name="claude")
 @click.option(
     "--from",
     "from_dir",
     type=click.Path(path_type=Path),
     default=None,
-    help="Native Claude config directory. Defaults to ~/.claude.",
+    help="Claude Code config directory. Defaults to ~/.claude.",
 )
 @click.option(
     "--into",
@@ -3815,7 +3815,7 @@ def _prompt_import_conflict(rel: str, target: Path) -> str:
     is_flag=True,
     help="Allow preserving non-secret literal header/env values instead of externalizing them.",
 )
-def agent_import_claude(
+def tool_import_claude(
     from_dir: Path | None,
     into: Path,
     import_mcp: bool,
@@ -3826,7 +3826,7 @@ def agent_import_claude(
     force: bool,
 ) -> None:
     """Import Claude Code MCP servers and skills."""
-    _run_agent_import_command(
+    _run_tool_import_command(
         source="claude",
         from_dir=from_dir,
         into=into,
@@ -3839,13 +3839,13 @@ def agent_import_claude(
     )
 
 
-@agent_import.command(name="codex")
+@tool_import.command(name="codex")
 @click.option(
     "--from",
     "from_dir",
     type=click.Path(path_type=Path),
     default=None,
-    help="Native Codex config directory. Defaults to ~/.codex.",
+    help="Codex config directory. Defaults to ~/.codex.",
 )
 @click.option(
     "--into",
@@ -3869,7 +3869,7 @@ def agent_import_claude(
     is_flag=True,
     help="Allow preserving non-secret literal header/env values instead of externalizing them.",
 )
-def agent_import_codex(
+def tool_import_codex(
     from_dir: Path | None,
     into: Path,
     import_mcp: bool,
@@ -3880,7 +3880,7 @@ def agent_import_codex(
     force: bool,
 ) -> None:
     """Import Codex MCP servers and skills."""
-    _run_agent_import_command(
+    _run_tool_import_command(
         source="codex",
         from_dir=from_dir,
         into=into,
@@ -3893,13 +3893,13 @@ def agent_import_codex(
     )
 
 
-@agent_import.command(name="cursor")
+@tool_import.command(name="cursor")
 @click.option(
     "--from",
     "from_dir",
     type=click.Path(path_type=Path),
     default=None,
-    help="Native Cursor config directory. Defaults to ~/.cursor.",
+    help="Cursor config directory. Defaults to ~/.cursor.",
 )
 @click.option(
     "--into",
@@ -3923,7 +3923,7 @@ def agent_import_codex(
     is_flag=True,
     help="Allow preserving non-secret literal header/env values instead of externalizing them.",
 )
-def agent_import_cursor(
+def tool_import_cursor(
     from_dir: Path | None,
     into: Path,
     import_mcp: bool,
@@ -3934,7 +3934,7 @@ def agent_import_cursor(
     force: bool,
 ) -> None:
     """Import Cursor MCP servers and skills."""
-    _run_agent_import_command(
+    _run_tool_import_command(
         source="cursor",
         from_dir=from_dir,
         into=into,
@@ -3947,7 +3947,7 @@ def agent_import_cursor(
     )
 
 
-@agent_import.command(name="pi")
+@tool_import.command(name="pi")
 @click.option(
     "--from",
     "from_dir",
@@ -3977,7 +3977,7 @@ def agent_import_cursor(
     is_flag=True,
     help="Allow preserving non-secret literal header/env values instead of externalizing them.",
 )
-def agent_import_pi(
+def tool_import_pi(
     from_dir: Path | None,
     into: Path,
     import_mcp: bool,
@@ -3987,8 +3987,8 @@ def agent_import_pi(
     on_conflict: str | None,
     force: bool,
 ) -> None:
-    """Import Pi assets from an explicitly supplied directory."""
-    _run_agent_import_command(
+    """Import Pi MCP servers and skills from an explicitly supplied directory."""
+    _run_tool_import_command(
         source="pi",
         from_dir=from_dir,
         into=into,
@@ -4001,7 +4001,7 @@ def agent_import_pi(
     )
 
 
-def _run_agent_import_command(
+def _run_tool_import_command(
     *,
     source: str,
     from_dir: Path | None,
@@ -4014,9 +4014,9 @@ def _run_agent_import_command(
     force: bool,
 ) -> None:
     """
-    Shared implementation for ``omnigent agent import <source>`` commands.
+    Shared implementation for ``omnigent tool import <source>`` commands.
     """
-    from omnigent.agent_import import (
+    from omnigent.tool_import import (
         apply_import_plan,
         check_import_drift,
         default_conflict_mode,
