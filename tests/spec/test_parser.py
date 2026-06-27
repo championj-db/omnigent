@@ -931,13 +931,12 @@ def test_parse_mcp_http(
     :param monkeypatch: Pytest monkeypatch for env vars.
     """
     monkeypatch.setenv("API_KEY", "sk-test-key")
-    monkeypatch.setenv("MCP_HOST", "localhost")
     mcp_dir = agent_dir / "tools" / "mcp"
     mcp_dir.mkdir(parents=True)
     mcp_config = {
         "name": "my-service",
         "transport": "http",
-        "url": "http://${MCP_HOST}:9000/mcp",
+        "url": "http://localhost:9000/mcp",
         "headers": {"Authorization": "Bearer ${API_KEY}"},
     }
     (mcp_dir / "service.yaml").write_text(yaml.dump(mcp_config))

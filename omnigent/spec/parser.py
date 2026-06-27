@@ -2350,7 +2350,7 @@ def _parse_http_mcp_server(
     return MCPServerConfig(
         name=str(name),
         transport="http",
-        url=(expand_env_vars({"url": str(url)})["url"] if expand_env else str(url)),
+        url=str(url),
         headers=(
             expand_env_vars(raw.get("headers", {})) if expand_env else raw.get("headers", {})
         ),

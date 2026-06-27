@@ -144,8 +144,8 @@ def test_force_preserves_non_secret_literals_without_env_example_noise(
     )
 
 
-def test_http_url_query_secrets_are_externalized(tmp_path: Path) -> None:
-    """Secret-looking URL query params never copy literal values into MCP YAML."""
+def test_http_url_query_values_are_imported_as_is(tmp_path: Path) -> None:
+    """HTTP MCP URLs are copied without changing query parameters."""
     claude_dir = tmp_path / ".claude"
     claude_dir.mkdir()
     (tmp_path / ".claude.json").write_text(
@@ -174,11 +174,10 @@ def test_http_url_query_secrets_are_externalized(tmp_path: Path) -> None:
     apply_import_plan(plan)
 
     mcp_text = (into / "tools" / "mcp" / "remote.yaml").read_text(encoding="utf-8")
-    assert "sk-abcdefghijklmnop" not in mcp_text
     mcp = yaml.safe_load(mcp_text)
-    assert mcp["url"] == "https://mcp.example/sse?api_key=${MCP_REMOTE_API_KEY}&team=dev"
-    assert (into / ".env.example").read_text(encoding="utf-8") == "MCP_REMOTE_API_KEY=\n"
-    assert any("URL query parameters" in warning for warning in plan.warnings)
+    assert mcp["url"] == "https://mcp.example/sse?api_key=sk-abcdefghijklmnop&team=dev"
+    assert not (into / ".env.example").exists()
+    assert not any("URL query parameters" in warning for warning in plan.warnings)
 
 
 def test_http_url_hosted_path_ids_are_not_externalized(tmp_path: Path) -> None:
