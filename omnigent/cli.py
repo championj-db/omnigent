@@ -1204,6 +1204,7 @@ _CLICK_SUBCOMMANDS: frozenset[str] = frozenset(
         "server",
         "setup",
         "stop",
+        "tool",
         "update",
         "upgrade",
         "version",
@@ -3754,6 +3755,360 @@ def upgrade(check_only: bool, force: bool, pre: bool) -> None:
 cli.add_command(upgrade, name="update")
 
 
+@cli.group(name="tool")
+def tool() -> None:
+    """Manage local Omnigent tool assets."""
+
+
+@tool.group(name="import")
+def tool_import() -> None:
+    """Import MCP server configs and skills into an Omnigent bundle."""
+
+
+def _prompt_import_conflict(rel: str, target: Path) -> str:
+    """
+    Prompt for import conflict resolution.
+
+    :param rel: Bundle-relative path being written.
+    :param target: Existing target path.
+    :returns: One of ``skip``, ``overwrite``, or ``fail``.
+    """
+    click.echo(f"Import target exists: {rel} ({target})", err=True)
+    return cast(
+        str,
+        click.prompt(
+            "Action",
+            type=click.Choice(["skip", "overwrite", "fail"]),
+            default="fail",
+            show_choices=True,
+        ),
+    )
+
+
+@tool_import.command(name="claude")
+@click.option(
+    "--from",
+    "from_dir",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="Claude Code config directory. Defaults to ~/.claude.",
+)
+@click.option(
+    "--into",
+    "into",
+    type=click.Path(path_type=Path),
+    required=True,
+    help="Omnigent agent bundle directory to update or create.",
+)
+@click.option("--mcp", "import_mcp", is_flag=True, help="Import MCP server configs.")
+@click.option("--skills", "import_skills", is_flag=True, help="Import SKILL.md directories.")
+@click.option("--dry-run", is_flag=True, help="Show planned changes without writing files.")
+@click.option("--check", "check_only", is_flag=True, help="Check imported artifacts for drift.")
+@click.option(
+    "--on-conflict",
+    type=click.Choice(["fail", "skip", "overwrite", "prompt"]),
+    default=None,
+    help="Conflict behavior. Defaults to prompt on TTY and fail otherwise.",
+)
+@click.option(
+    "--force",
+    is_flag=True,
+    help="Allow preserving non-secret literal header/env values instead of externalizing them.",
+)
+@click.option(
+    "--mode",
+    type=click.Choice(["inline", "directory"]),
+    default="inline",
+    show_default=True,
+    help="MCP layout: 'inline' writes servers into config.yaml's tools block; "
+    "'directory' writes one tools/mcp/<name>.yaml file per server.",
+)
+def tool_import_claude(
+    from_dir: Path | None,
+    into: Path,
+    import_mcp: bool,
+    import_skills: bool,
+    dry_run: bool,
+    check_only: bool,
+    on_conflict: str | None,
+    force: bool,
+    mode: str,
+) -> None:
+    """Import Claude Code MCP servers and skills."""
+    _run_tool_import_command(
+        source="claude",
+        from_dir=from_dir,
+        into=into,
+        import_mcp=import_mcp,
+        import_skills=import_skills,
+        dry_run=dry_run,
+        check_only=check_only,
+        on_conflict=on_conflict,
+        force=force,
+        mode=mode,
+    )
+
+
+@tool_import.command(name="codex")
+@click.option(
+    "--from",
+    "from_dir",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="Codex config directory. Defaults to ~/.codex.",
+)
+@click.option(
+    "--into",
+    "into",
+    type=click.Path(path_type=Path),
+    required=True,
+    help="Omnigent agent bundle directory to update or create.",
+)
+@click.option("--mcp", "import_mcp", is_flag=True, help="Import MCP server configs.")
+@click.option("--skills", "import_skills", is_flag=True, help="Import SKILL.md directories.")
+@click.option("--dry-run", is_flag=True, help="Show planned changes without writing files.")
+@click.option("--check", "check_only", is_flag=True, help="Check imported artifacts for drift.")
+@click.option(
+    "--on-conflict",
+    type=click.Choice(["fail", "skip", "overwrite", "prompt"]),
+    default=None,
+    help="Conflict behavior. Defaults to prompt on TTY and fail otherwise.",
+)
+@click.option(
+    "--force",
+    is_flag=True,
+    help="Allow preserving non-secret literal header/env values instead of externalizing them.",
+)
+@click.option(
+    "--mode",
+    type=click.Choice(["inline", "directory"]),
+    default="inline",
+    show_default=True,
+    help="MCP layout: 'inline' writes servers into config.yaml's tools block; "
+    "'directory' writes one tools/mcp/<name>.yaml file per server.",
+)
+def tool_import_codex(
+    from_dir: Path | None,
+    into: Path,
+    import_mcp: bool,
+    import_skills: bool,
+    dry_run: bool,
+    check_only: bool,
+    on_conflict: str | None,
+    force: bool,
+    mode: str,
+) -> None:
+    """Import Codex MCP servers and skills."""
+    _run_tool_import_command(
+        source="codex",
+        from_dir=from_dir,
+        into=into,
+        import_mcp=import_mcp,
+        import_skills=import_skills,
+        dry_run=dry_run,
+        check_only=check_only,
+        on_conflict=on_conflict,
+        force=force,
+        mode=mode,
+    )
+
+
+@tool_import.command(name="cursor")
+@click.option(
+    "--from",
+    "from_dir",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="Cursor config directory. Defaults to ~/.cursor.",
+)
+@click.option(
+    "--into",
+    "into",
+    type=click.Path(path_type=Path),
+    required=True,
+    help="Omnigent agent bundle directory to update or create.",
+)
+@click.option("--mcp", "import_mcp", is_flag=True, help="Import MCP server configs.")
+@click.option("--skills", "import_skills", is_flag=True, help="Import SKILL.md directories.")
+@click.option("--dry-run", is_flag=True, help="Show planned changes without writing files.")
+@click.option("--check", "check_only", is_flag=True, help="Check imported artifacts for drift.")
+@click.option(
+    "--on-conflict",
+    type=click.Choice(["fail", "skip", "overwrite", "prompt"]),
+    default=None,
+    help="Conflict behavior. Defaults to prompt on TTY and fail otherwise.",
+)
+@click.option(
+    "--force",
+    is_flag=True,
+    help="Allow preserving non-secret literal header/env values instead of externalizing them.",
+)
+@click.option(
+    "--mode",
+    type=click.Choice(["inline", "directory"]),
+    default="inline",
+    show_default=True,
+    help="MCP layout: 'inline' writes servers into config.yaml's tools block; "
+    "'directory' writes one tools/mcp/<name>.yaml file per server.",
+)
+def tool_import_cursor(
+    from_dir: Path | None,
+    into: Path,
+    import_mcp: bool,
+    import_skills: bool,
+    dry_run: bool,
+    check_only: bool,
+    on_conflict: str | None,
+    force: bool,
+    mode: str,
+) -> None:
+    """Import Cursor MCP servers and skills."""
+    _run_tool_import_command(
+        source="cursor",
+        from_dir=from_dir,
+        into=into,
+        import_mcp=import_mcp,
+        import_skills=import_skills,
+        dry_run=dry_run,
+        check_only=check_only,
+        on_conflict=on_conflict,
+        force=force,
+        mode=mode,
+    )
+
+
+@tool_import.command(name="pi")
+@click.option(
+    "--from",
+    "from_dir",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="Concrete Pi config directory to enumerate.",
+)
+@click.option(
+    "--into",
+    "into",
+    type=click.Path(path_type=Path),
+    required=True,
+    help="Omnigent agent bundle directory to update or create.",
+)
+@click.option("--mcp", "import_mcp", is_flag=True, help="Import MCP server configs.")
+@click.option("--skills", "import_skills", is_flag=True, help="Import SKILL.md directories.")
+@click.option("--dry-run", is_flag=True, help="Show planned changes without writing files.")
+@click.option("--check", "check_only", is_flag=True, help="Check imported artifacts for drift.")
+@click.option(
+    "--on-conflict",
+    type=click.Choice(["fail", "skip", "overwrite", "prompt"]),
+    default=None,
+    help="Conflict behavior. Defaults to prompt on TTY and fail otherwise.",
+)
+@click.option(
+    "--force",
+    is_flag=True,
+    help="Allow preserving non-secret literal header/env values instead of externalizing them.",
+)
+@click.option(
+    "--mode",
+    type=click.Choice(["inline", "directory"]),
+    default="inline",
+    show_default=True,
+    help="MCP layout: 'inline' writes servers into config.yaml's tools block; "
+    "'directory' writes one tools/mcp/<name>.yaml file per server.",
+)
+def tool_import_pi(
+    from_dir: Path | None,
+    into: Path,
+    import_mcp: bool,
+    import_skills: bool,
+    dry_run: bool,
+    check_only: bool,
+    on_conflict: str | None,
+    force: bool,
+    mode: str,
+) -> None:
+    """Import Pi MCP servers and skills from an explicitly supplied directory."""
+    _run_tool_import_command(
+        source="pi",
+        from_dir=from_dir,
+        into=into,
+        import_mcp=import_mcp,
+        import_skills=import_skills,
+        dry_run=dry_run,
+        check_only=check_only,
+        on_conflict=on_conflict,
+        force=force,
+        mode=mode,
+    )
+
+
+def _run_tool_import_command(
+    *,
+    source: str,
+    from_dir: Path | None,
+    into: Path,
+    import_mcp: bool,
+    import_skills: bool,
+    dry_run: bool,
+    check_only: bool,
+    on_conflict: str | None,
+    force: bool,
+    mode: str,
+) -> None:
+    """
+    Shared implementation for ``omnigent tool import <source>`` commands.
+    """
+    from omnigent.errors import OmnigentError
+    from omnigent.tool_import import (
+        apply_import_plan,
+        check_import_drift,
+        default_conflict_mode,
+        plan_import,
+    )
+
+    try:
+        if check_only:
+            result = check_import_drift(into)
+            for rel in result.ok:
+                click.echo(f"ok: {rel}")
+            for rel in result.changed:
+                click.echo(f"changed: {rel}")
+            for rel in result.missing:
+                click.echo(f"missing: {rel}")
+            if not result.clean:
+                raise SystemExit(1)
+            click.echo(f"Import provenance is clean: {result.imports_path}")
+            return
+
+        conflict_mode = cast(Any, on_conflict or default_conflict_mode())
+        plan = plan_import(
+            source=cast(Any, source),
+            source_dir=from_dir,
+            into=into,
+            import_mcp=import_mcp,
+            import_skills=import_skills,
+            dry_run=dry_run,
+            on_conflict=conflict_mode,
+            mode=cast(Any, mode),
+            force=force,
+            prompt_resolver=_prompt_import_conflict if conflict_mode == "prompt" else None,
+        )
+        prefix = "Would write" if dry_run else "Writing"
+        for artifact in plan.artifacts:
+            if artifact.action in {"create", "update"}:
+                click.echo(f"{prefix} {artifact.relative_path} ({artifact.action})")
+            elif artifact.action == "unchanged":
+                click.echo(f"Unchanged {artifact.relative_path}")
+        for warning in plan.warnings:
+            click.echo(f"warning: {warning}", err=True)
+        apply_import_plan(plan)
+        if dry_run:
+            click.echo("Dry run complete; no files written.")
+        else:
+            click.echo(f"Imported {source} assets into {into}.")
+    except OmnigentError as exc:
+        raise click.ClickException(exc.message) from exc
+
+
 def _bundle(source: Path) -> bytes:
     """
     Produce a tar.gz bundle from a directory or standalone
@@ -3826,7 +4181,7 @@ def _resolve_bundle_env_vars(source: Path) -> dict[str, str]:
       ``executor.connection.*`` values, ``executor.auth``
       ``api_key`` / ``base_url`` (when ``type: api_key``), and
       ``tools.builtins[*]`` dict-entry values (except ``name``)
-    - ``tools/mcp/*.yaml``: ``headers.*`` and ``env.*`` values
+    - ``tools/mcp/*.yaml``: ``url``, ``headers.*`` and ``env.*`` values
 
     These mirror the server-side parser's ``${VAR}`` expansion
     sites. Resolving here, against the client's own environment,
@@ -3856,9 +4211,10 @@ def _resolve_bundle_env_vars(source: Path) -> dict[str, str]:
                 )
 
     # ── tools/mcp/*.yaml ─────────────────────────────
-    # ``headers`` (HTTP transport auth) and ``env`` (stdio transport
-    # process env) are both secret-bearing and both expanded by the
-    # server-side parser, so resolve both client-side.
+    # ``url`` (HTTP endpoint auth in query/userinfo), ``headers`` (HTTP
+    # transport auth), and ``env`` (stdio transport process env) are
+    # secret-bearing and expanded by the server-side parser, so resolve
+    # them client-side for uploaded bundles.
     mcp_dir = source / "tools" / "mcp"
     if mcp_dir.is_dir():
         for yaml_file in sorted(mcp_dir.glob("*.yaml")):
@@ -3866,6 +4222,9 @@ def _resolve_bundle_env_vars(source: Path) -> dict[str, str]:
             if not isinstance(raw, dict):
                 continue
             changed = False
+            if isinstance(raw.get("url"), str):
+                raw["url"] = expand_env_vars({"url": raw["url"]})["url"]
+                changed = True
             for field in ("headers", "env"):
                 value = raw.get(field)
                 if isinstance(value, dict):
