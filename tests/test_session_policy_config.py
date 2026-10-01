@@ -548,6 +548,107 @@ def test_daemon_live_reattach_skips_apply_and_guard_fails() -> None:
         ensure_session_policies_applied()
 
 
+def test_applied_state_survives_asyncio_run_boundary() -> None:
+    """A successful launch's apply is visible to the SYNC hand-off guard (B1).
+
+    Claude's guards run synchronously *after* ``asyncio.run()`` returns. The
+    apply happens inside that coroutine; with a ``ContextVar`` the clear would
+    not propagate out and the guard would falsely reject a successful launch.
+    The module global propagates, so the guard sees the applied state.
+    """
+    prime_session_policies([_spec("budget", "pkg.module.handler", None)])
+    requests: list[tuple[str, bytes]] = []
+    transport = _daemon_handler(requests, bound_runner=None, runner_online=False)
+
+    # Apply happens inside the coroutine driven by asyncio.run (copied context).
+    runner_id = _run_launch(transport, fresh=True)
+    assert runner_id == "runner_fresh"
+    assert ("POST", b"/v1/sessions/conv_x/policies") in requests
+
+    # The guard now runs synchronously, as a native launcher's does, and must
+    # NOT raise — it sees the policies as applied (cleared), not pending.
+    ensure_session_policies_applied()
+
+
+# --- claude -p one-shot resume: runner online but terminal torn down (B2) ---
+
+
+def _claude_resume_handler(
+    requests: list[tuple[str, bytes]],
+    *,
+    terminal_live: bool,
+) -> httpx.MockTransport:
+    """Build a transport for ``_attach_policy_config_for_resume``.
+
+    :param requests: Sink of ``(method, raw_path)`` per request.
+    :param terminal_live: Whether the claude terminal resource is still running.
+    :returns: A configured :class:`httpx.MockTransport`.
+    """
+    from omnigent.harnesses.claude_native.main import claude_terminal_resource_id
+
+    terminal_id = claude_terminal_resource_id()
+
+    async def _handler(request: httpx.Request) -> httpx.Response:
+        """Answer the terminal-liveness GET and the policy POST."""
+        requests.append((request.method, request.url.raw_path))
+        if "/resources/terminals/" in request.url.path:
+            if terminal_live:
+                return httpx.Response(
+                    200,
+                    json={"id": terminal_id, "type": "terminal", "metadata": {"running": True}},
+                )
+            return httpx.Response(404, json={})  # torn down (e.g. after `-p`)
+        if request.url.path.endswith("/policies"):
+            return httpx.Response(200, json={"id": "pol_x"})
+        return httpx.Response(200, json={})
+
+    return httpx.MockTransport(_handler)
+
+
+def _run_claude_resume(transport: httpx.MockTransport) -> None:
+    """Drive ``_attach_policy_config_for_resume`` through asyncio.run.
+
+    :param transport: Mock transport for the claude resume endpoints.
+    :returns: None.
+    """
+    from omnigent.harnesses.claude_native.main import _attach_policy_config_for_resume
+
+    async def _drive() -> None:
+        async with httpx.AsyncClient(
+            base_url="https://example.databricks.com", transport=transport
+        ) as client:
+            await _attach_policy_config_for_resume(client, "conv_x")
+
+    asyncio.run(_drive())
+
+
+def test_claude_resume_dead_terminal_applies_and_passes_guard() -> None:
+    """`claude -p` then `--resume --policy-config`: policy applied; guard passes."""
+    prime_session_policies([_spec("budget", "pkg.module.handler", None)])
+    requests: list[tuple[str, bytes]] = []
+
+    _run_claude_resume(_claude_resume_handler(requests, terminal_live=False))
+
+    # The torn-down terminal is a restart → policy IS applied before relaunch.
+    assert ("POST", b"/v1/sessions/conv_x/policies") in requests
+    # Applied → the synchronous hand-off guard does not raise.
+    ensure_session_policies_applied()
+
+
+def test_claude_resume_live_terminal_defers_to_guard() -> None:
+    """A genuinely live terminal reattach applies nothing; the guard rejects."""
+    prime_session_policies([_spec("budget", "pkg.module.handler", None)])
+    requests: list[tuple[str, bytes]] = []
+
+    _run_claude_resume(_claude_resume_handler(requests, terminal_live=True))
+
+    # Live terminal → true reattach → no policy POST.
+    assert all(not p.endswith(b"/policies") for (_m, p) in requests)
+    # Policies remain pending → the hand-off guard rejects the mid-run change.
+    with pytest.raises(click.ClickException, match="already running"):
+        ensure_session_policies_applied()
+
+
 # --- real native command wiring (option parsing on `omnigent pi`) ----------
 
 

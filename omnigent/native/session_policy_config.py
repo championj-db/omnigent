@@ -9,12 +9,21 @@ policies are attached to the one session via the per-session policy CRUD
 API (``POST /v1/sessions/{id}/policies``) instead of
 ``RuntimeCaps.default_policies``.
 
-The parsed policies travel from the Click command to the shared
-``bind_session_runner`` step through a context variable so every
-per-harness launcher applies them uniformly without threading a new
-parameter through each bespoke runner. The variable is primed by the
-``--policy-config`` option callback (see :data:`policy_config_option`)
-and consumed by :func:`apply_pending_session_policies`.
+The parsed policies travel from the Click command to the shared runner-bind
+step through module-level state so every per-harness launcher applies them
+uniformly without threading a new parameter through each bespoke runner. The
+state is primed by the ``--policy-config`` option callback (see
+:data:`policy_config_option`), consumed by
+:func:`apply_pending_session_policies` at the bind step, and verified by
+:func:`ensure_session_policies_applied` at each launcher's hand-off. A plain
+module global is used rather than a ``contextvars.ContextVar`` on purpose: the
+policies are primed on the synchronous CLI thread but applied inside the launch
+coroutine run via ``asyncio.run()``, which executes in a *copied* context — a
+ContextVar cleared there would be invisible to the synchronous hand-off guard
+that runs after ``asyncio.run()`` returns, so a successful launch would falsely
+trip the guard. A module global is shared across that boundary. The CLI runs
+one launch per process on a single thread (prime → launch → guard are strictly
+sequential), so there is no concurrency to isolate.
 
 Only ``type: function`` policies are expressible (the session policy
 store evaluates ``type="python"`` handlers), and the server requires each
@@ -25,7 +34,6 @@ a policy at an arbitrary importable callable.
 
 from __future__ import annotations
 
-import contextvars
 import logging
 from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING
@@ -39,13 +47,12 @@ if TYPE_CHECKING:
 
 _logger = logging.getLogger(__name__)
 
-# Policies parsed from ``--policy-config`` for the current launch. Primed by
-# the option callback (CLI thread) and read inside the runner's asyncio task,
-# which runs in a copy of that context, so the value propagates without a new
-# parameter on every ``run_<harness>_native`` seam. Empty tuple = flag absent.
-_PENDING_SESSION_POLICIES: contextvars.ContextVar[tuple[FunctionPolicySpec, ...]] = (
-    contextvars.ContextVar("omnigent_pending_session_policies", default=())
-)
+# Policies parsed from ``--policy-config`` for the current launch. A plain
+# module global (NOT a ContextVar) so that clearing it inside the launch
+# coroutine run via ``asyncio.run()`` is visible to the synchronous hand-off
+# guard that runs after ``asyncio.run()`` returns (see the module docstring).
+# Empty tuple = flag absent / already applied.
+_pending_session_policies: tuple[FunctionPolicySpec, ...] = ()
 
 
 def load_session_policy_config(path: str) -> list[FunctionPolicySpec]:
@@ -111,20 +118,25 @@ def load_session_policy_config(path: str) -> list[FunctionPolicySpec]:
 def prime_session_policies(specs: Sequence[FunctionPolicySpec]) -> None:
     """Record the policies to attach to the next launched/resumed session.
 
+    Overwrites any previously primed policies, so each launch (CLI invocation)
+    starts from a clean slate even in reentrant/embedded use.
+
     :param specs: Function policies parsed from ``--policy-config``; pass an
         empty sequence to clear any previously primed policies.
     :returns: None.
     """
-    _PENDING_SESSION_POLICIES.set(tuple(specs))
+    global _pending_session_policies
+    _pending_session_policies = tuple(specs)
 
 
 def pending_session_policies() -> tuple[FunctionPolicySpec, ...]:
     """Return the policies primed for the current launch.
 
     :returns: The primed function policies, or an empty tuple when
-        ``--policy-config`` was not supplied.
+        ``--policy-config`` was not supplied or the policies were already
+        applied.
     """
-    return _PENDING_SESSION_POLICIES.get()
+    return _pending_session_policies
 
 
 async def apply_pending_session_policies(
@@ -156,16 +168,19 @@ async def apply_pending_session_policies(
 
     from omnigent.host.daemon_launch import error_text
 
-    specs = _PENDING_SESSION_POLICIES.get()
+    global _pending_session_policies
+    specs = _pending_session_policies
     if not specs:
         return 0
 
     # Consume the pending policies up front: a session's policies are applied
-    # exactly once per launch. Clearing here (a) stops a second bind in the same
-    # context from re-applying them, and (b) lets ``ensure_session_policies_applied``
-    # detect a launch that never reached this apply step — a live-terminal
-    # reattach, where bind is skipped — by seeing the list still populated.
-    _PENDING_SESSION_POLICIES.set(())
+    # exactly once per launch. Clearing here (a) stops a second bind from
+    # re-applying them, and (b) lets ``ensure_session_policies_applied`` detect
+    # a launch that never reached this apply step — a live reattach, where the
+    # runner bind is skipped — by seeing the list still populated. Because this
+    # is a module global (not a ContextVar), the clear is visible to the
+    # synchronous hand-off guard even when apply runs inside ``asyncio.run()``.
+    _pending_session_policies = ()
 
     encoded = urllib.parse.quote(session_id, safe="")
     created = 0
@@ -229,13 +244,14 @@ def ensure_session_policies_applied() -> None:
     :returns: None.
     :raises click.ClickException: When policies were primed but not applied.
     """
-    pending = _PENDING_SESSION_POLICIES.get()
+    global _pending_session_policies
+    pending = _pending_session_policies
     if not pending:
         return
     names = ", ".join(sorted(spec.name for spec in pending))
-    # Consume so a retry within the same context (embedded/reentrant use)
-    # starts clean rather than re-raising on a stale list.
-    _PENDING_SESSION_POLICIES.set(())
+    # Consume so a retry (embedded/reentrant use) starts clean rather than
+    # re-raising on a stale list.
+    _pending_session_policies = ()
     raise click.ClickException(
         "--policy-config cannot be applied here: this resumes a session that is "
         "already running (its runner/terminal is live), and changing a session's "

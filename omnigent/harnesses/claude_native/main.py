@@ -140,7 +140,10 @@ from omnigent.native.native_terminal import (
 from omnigent.native.native_terminal import (
     terminal_attach_url as _attach_url,
 )
-from omnigent.native.session_policy_config import ensure_session_policies_applied
+from omnigent.native.session_policy_config import (
+    apply_pending_session_policies,
+    ensure_session_policies_applied,
+)
 from omnigent.process_logging import log_info_once
 from omnigent.terminals.ws_common import (
     WS_CLOSE_TERMINAL_DETACHED,
@@ -4685,6 +4688,10 @@ async def _prepare_claude_terminal_via_daemon(
                 "daemon runner online",
                 startup_progress=startup_progress,
             )
+            # A reused online runner skips the fresh-launch policy attach in
+            # ``launch_or_reuse_daemon_runner``, so decide here based on terminal
+            # liveness (see helper).
+            await _attach_policy_config_for_resume(client, session_id)
             # Resume onto an already-online daemon runner reuses it without
             # re-running the session-start auto-create, so a runner whose
             # terminal was torn down (e.g. after a ``-p`` one-shot) comes
@@ -6270,6 +6277,39 @@ async def _launch_claude_terminal(
         with contextlib.suppress(Exception):
             await asyncio.to_thread(ClaudeDebugLogFollower(bridge_dir).close, session_id)
         raise
+
+
+async def _attach_policy_config_for_resume(
+    client: httpx.AsyncClient,
+    session_id: str,
+) -> None:
+    """Attach ``--policy-config`` policies when resuming a torn-down terminal.
+
+    Claude's daemon path reuses an already-online runner without the
+    fresh-launch policy attach in ``launch_or_reuse_daemon_runner``, so the
+    resume decision is made here from terminal liveness:
+
+    - terminal torn down / absent (e.g. after a ``-p`` one-shot) — the agent is
+      being restarted, a cold-ish resume, so attach the policies before the
+      replacement terminal starts; and
+    - terminal still live — a true reattach, so leave the policies pending for
+      the launcher's hand-off guard to reject the mid-run change.
+
+    A no-op when ``--policy-config`` was not supplied or when the policies were
+    already attached during a fresh-runner launch.
+
+    :param client: HTTP client pointed at the Omnigent server.
+    :param session_id: Session/conversation id, e.g. ``"conv_abc123"``.
+    :returns: None.
+    :raises click.ClickException: If the server rejects a policy.
+    """
+    if await _find_running_claude_terminal(client, session_id) is not None:
+        return
+    await apply_pending_session_policies(
+        client,
+        session_id,
+        notify=lambda message: click.echo(message, err=True),
+    )
 
 
 async def _find_running_claude_terminal(
