@@ -140,6 +140,7 @@ from omnigent.native.native_terminal import (
 from omnigent.native.native_terminal import (
     terminal_attach_url as _attach_url,
 )
+from omnigent.native.session_policy_config import ensure_session_policies_applied
 from omnigent.process_logging import log_info_once
 from omnigent.terminals.ws_common import (
     WS_CLOSE_TERMINAL_DETACHED,
@@ -3703,6 +3704,7 @@ def _run_with_local_server(
             # future ``--resume`` can detect mismatches.
             _record_launch_for_fresh_session(prepared.session_id)
             startup_profiler.mark("fresh session launch state recorded")
+        ensure_session_policies_applied()
         click.echo(f"Web UI: {conversation_url(base_url, prepared.session_id)}", err=True)
         startup_profiler.mark("web ui url printed")
         open_conversation_link_if_enabled(
@@ -4906,6 +4908,7 @@ def _run_with_remote_server(
         if resolved_session_id is None:
             _record_launch_for_fresh_session(prepared.session_id)
             startup_profiler.mark("fresh remote launch state recorded")
+        ensure_session_policies_applied()
         click.echo(f"Web UI: {conversation_url(base_url, prepared.session_id)}", err=True)
         startup_profiler.mark("remote web ui url printed")
         open_conversation_link_if_enabled(

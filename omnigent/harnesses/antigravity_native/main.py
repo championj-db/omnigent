@@ -150,6 +150,7 @@ from omnigent.native.native_terminal import (
 from omnigent.native.native_terminal import (
     terminal_attach_url as _attach_url,
 )
+from omnigent.native.session_policy_config import ensure_session_policies_applied
 
 _logger = logging.getLogger(__name__)
 
@@ -413,6 +414,7 @@ def _run_with_local_server(
                     headless=headless,
                     startup_progress=progress,
                 )
+            ensure_session_policies_applied()
             click.echo(f"Web UI: {conversation_url(base_url, prepared.session_id)}", err=True)
             open_conversation_link_if_enabled(
                 base_url=base_url,
@@ -518,6 +520,7 @@ def _run_with_remote_server(
                     workspace=str(Path.cwd().resolve()),
                     startup_progress=progress,
                 )
+            ensure_session_policies_applied()
             click.echo(f"Web UI: {conversation_url(base_url, prepared.session_id)}", err=True)
             open_conversation_link_if_enabled(
                 base_url=base_url,

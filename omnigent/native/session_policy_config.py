@@ -160,6 +160,13 @@ async def apply_pending_session_policies(
     if not specs:
         return 0
 
+    # Consume the pending policies up front: a session's policies are applied
+    # exactly once per launch. Clearing here (a) stops a second bind in the same
+    # context from re-applying them, and (b) lets ``ensure_session_policies_applied``
+    # detect a launch that never reached this apply step — a live-terminal
+    # reattach, where bind is skipped — by seeing the list still populated.
+    _PENDING_SESSION_POLICIES.set(())
+
     encoded = urllib.parse.quote(session_id, safe="")
     created = 0
     for spec in specs:
@@ -200,6 +207,42 @@ async def apply_pending_session_policies(
         created,
     )
     return created
+
+
+def ensure_session_policies_applied() -> None:
+    """Fail if ``--policy-config`` policies were primed but never applied.
+
+    Every new or cold-resumed launch attaches its policies in
+    :func:`apply_pending_session_policies` — invoked from the runner-bind step
+    (``launch_or_reuse_daemon_runner`` on the daemon path, or
+    ``bind_session_runner``) — which consumes the pending list. Reaching the
+    post-prepare handoff with policies still pending therefore means the launch
+    reused an already-live session (its runner/terminal was still running, so
+    no fresh bind happened), so the requested policy was never applied.
+    Changing a session's contextual policy mid-run is out of scope (tracked
+    follow-up), so fail loudly here rather than silently drop the flag.
+
+    Called from each native launcher right before the "Web UI" handoff. A
+    no-op when nothing was primed (the common case) or when apply already
+    consumed the list.
+
+    :returns: None.
+    :raises click.ClickException: When policies were primed but not applied.
+    """
+    pending = _PENDING_SESSION_POLICIES.get()
+    if not pending:
+        return
+    names = ", ".join(sorted(spec.name for spec in pending))
+    # Consume so a retry within the same context (embedded/reentrant use)
+    # starts clean rather than re-raising on a stale list.
+    _PENDING_SESSION_POLICIES.set(())
+    raise click.ClickException(
+        "--policy-config cannot be applied here: this resumes a session that is "
+        "already running (its runner/terminal is live), and changing a session's "
+        "contextual policy mid-run is not supported yet (tracked follow-up). Stop "
+        "the running session first, or relaunch without --policy-config. "
+        f"Policies not applied: {names}."
+    )
 
 
 def _plural(count: int, singular: str, plural: str) -> str:
@@ -250,7 +293,9 @@ policy_config_option = click.option(
         "Apply a session-scoped contextual policy config (a YAML file with a "
         "top-level `policies:` mapping, same grammar as `omnigent server "
         "--config`) to THIS session only; server-wide defaults are unchanged. "
-        "Works with --resume. Handlers must be registered policies (builtins, "
-        "or modules added via the server's `policy_modules`)."
+        "Applied on launch and on cold resume (a session that is not currently "
+        "running); resuming a session that is already live fails rather than "
+        "changing policy mid-run. Handlers must be registered policies "
+        "(builtins, or modules added via the server's `policy_modules`)."
     ),
 )

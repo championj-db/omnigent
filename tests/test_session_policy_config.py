@@ -10,6 +10,7 @@ resumed native launches.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import Iterator
 from pathlib import Path
@@ -19,15 +20,33 @@ import httpx
 import pytest
 from click.testing import CliRunner
 
+from omnigent.host.daemon_launch import launch_or_reuse_daemon_runner
 from omnigent.native import native_terminal
 from omnigent.native.session_policy_config import (
     apply_pending_session_policies,
+    ensure_session_policies_applied,
     load_session_policy_config,
     pending_session_policies,
     policy_config_option,
     prime_session_policies,
 )
 from omnigent.spec.types import FunctionPolicySpec, FunctionRef
+
+# Harness commands that must all accept --policy-config (parameterized test #5).
+_HARNESS_COMMANDS = (
+    "claude",
+    "codex",
+    "cursor",
+    "pi",
+    "goose",
+    "kimi",
+    "qwen",
+    "antigravity",
+    "devin",
+    "kiro",
+    "hermes",
+    "opencode",
+)
 
 
 @pytest.fixture(autouse=True)
@@ -173,6 +192,17 @@ def test_option_reports_invalid_config(tmp_path: Path) -> None:
     assert "no policies" in result.output
 
 
+@pytest.mark.parametrize("command", _HARNESS_COMMANDS)
+def test_every_harness_command_exposes_policy_config(command: str) -> None:
+    """`--policy-config` is wired uniformly onto every `omni <harness>` command."""
+    from omnigent.cli import cli
+
+    result = CliRunner().invoke(cli, [command, "--help"])
+
+    assert result.exit_code == 0, result.output
+    assert "--policy-config" in result.output
+
+
 # --- apply_pending_session_policies ----------------------------------------
 
 
@@ -313,7 +343,7 @@ async def test_apply_raises_on_server_rejection() -> None:
             await apply_pending_session_policies(client, "conv_abc")
 
 
-# --- integration with the shared bind step ---------------------------------
+# --- atomicity: policies POSTed before the runner bind (bind_session_runner) ---
 
 
 async def _run_bind(session_id: str, requests: list[tuple[str, bytes]]) -> None:
@@ -337,26 +367,42 @@ async def _run_bind(session_id: str, requests: list[tuple[str, bytes]]) -> None:
 
 
 @pytest.mark.asyncio
-async def test_bind_applies_primed_policies_on_new_session() -> None:
-    """Binding a freshly launched session attaches the primed policies."""
+async def test_bind_posts_policies_before_binding_runner() -> None:
+    """Policies are POSTed BEFORE the runner-bind PATCH (atomic ordering)."""
     prime_session_policies([_spec("budget", "pkg.module.handler", None)])
     requests: list[tuple[str, bytes]] = []
 
     await _run_bind("conv_new", requests)
 
-    assert ("PATCH", b"/v1/sessions/conv_new") in requests
-    assert ("POST", b"/v1/sessions/conv_new/policies") in requests
+    # POST /policies strictly precedes the PATCH that binds the runner.
+    assert requests == [
+        ("POST", b"/v1/sessions/conv_new/policies"),
+        ("PATCH", b"/v1/sessions/conv_new"),
+    ]
 
 
 @pytest.mark.asyncio
-async def test_bind_applies_primed_policies_on_resume() -> None:
-    """Cold-resume funnels through the same bind step, so policies apply too."""
-    prime_session_policies([_spec("budget", "pkg.module.handler", None)])
+async def test_bind_aborts_without_binding_when_policy_rejected() -> None:
+    """A rejected policy aborts the launch with no runner-bind PATCH sent."""
+    prime_session_policies([_spec("bad", "pkg.module.handler", None)])
     requests: list[tuple[str, bytes]] = []
 
-    await _run_bind("conv_resumed", requests)
+    async def _handler(request: httpx.Request) -> httpx.Response:
+        """Reject the policy POST; record every request."""
+        requests.append((request.method, request.url.raw_path))
+        if request.url.path.endswith("/policies"):
+            return httpx.Response(400, json={"detail": "handler not registered"}, request=request)
+        return httpx.Response(200, json={})
 
-    assert ("POST", b"/v1/sessions/conv_resumed/policies") in requests
+    async with httpx.AsyncClient(
+        base_url="https://example.databricks.com",
+        transport=httpx.MockTransport(_handler),
+    ) as client:
+        with pytest.raises(click.ClickException, match="handler not registered"):
+            await native_terminal.bind_session_runner(client, "conv_new", "runner_1")
+
+    # Only the (failed) policy POST was attempted — the runner was never bound.
+    assert requests == [("POST", b"/v1/sessions/conv_new/policies")]
 
 
 @pytest.mark.asyncio
@@ -367,6 +413,139 @@ async def test_bind_without_policies_only_binds() -> None:
     await _run_bind("conv_plain", requests)
 
     assert requests == [("PATCH", b"/v1/sessions/conv_plain")]
+
+
+# --- live-reattach guard ----------------------------------------------------
+
+
+def test_guard_is_noop_when_nothing_pending() -> None:
+    """The handoff guard does nothing when --policy-config was not supplied."""
+    ensure_session_policies_applied()  # no raise
+
+
+def test_guard_raises_when_policies_were_never_applied() -> None:
+    """Pending-but-unapplied policies (live reattach) fail with a clear error."""
+    prime_session_policies([_spec("budget", "pkg.module.handler", None)])
+
+    with pytest.raises(click.ClickException, match="already running") as excinfo:
+        ensure_session_policies_applied()
+
+    assert "mid-run is not supported" in str(excinfo.value)
+    # Consumed on raise so a retry in the same context starts clean.
+    assert pending_session_policies() == ()
+
+
+# --- genuine daemon flow (launch_or_reuse_daemon_runner via asyncio.run) -----
+#
+# These drive the universal daemon bind point end to end THROUGH ``asyncio.run``,
+# so they prove the context variable primed on the CLI thread survives the real
+# async boundary into the runner coroutine, exactly as a native launch does.
+
+
+def _daemon_handler(
+    requests: list[tuple[str, bytes]],
+    *,
+    bound_runner: str | None,
+    runner_online: bool,
+) -> httpx.MockTransport:
+    """Build a MockTransport emulating the daemon runner-launch endpoints.
+
+    :param requests: Sink of ``(method, raw_path)`` per request.
+    :param bound_runner: Runner id already bound to the session, or ``None``.
+    :param runner_online: Whether that bound runner reports online.
+    :returns: A configured :class:`httpx.MockTransport`.
+    """
+
+    async def _handler(request: httpx.Request) -> httpx.Response:
+        """Answer the GET session / runner-status / launch / policy routes."""
+        requests.append((request.method, request.url.raw_path))
+        path = request.url.path
+        if request.method == "GET" and path.startswith("/v1/sessions/"):
+            body = {"runner_id": bound_runner} if bound_runner else {}
+            return httpx.Response(200, json=body)
+        if path.endswith("/status"):
+            return httpx.Response(200, json={"online": runner_online})
+        if path.endswith("/policies"):
+            return httpx.Response(200, json={"id": "pol_x"})
+        if path.endswith("/runners"):
+            return httpx.Response(200, json={"runner_id": "runner_fresh"})
+        return httpx.Response(200, json={})
+
+    return httpx.MockTransport(_handler)
+
+
+def _run_launch(transport: httpx.MockTransport, *, fresh: bool) -> str:
+    """Prime policies, then drive ``launch_or_reuse_daemon_runner`` via asyncio.run.
+
+    Priming happens on this (synchronous) thread; ``asyncio.run`` copies the
+    current context into the coroutine, mirroring how a native launcher primes
+    in its Click callback and then calls ``asyncio.run(_drive())``.
+
+    :param transport: Mock transport for the daemon endpoints.
+    :param fresh: The ``fresh`` flag (``True`` for a brand-new session).
+    :returns: The bound runner id.
+    """
+
+    async def _drive() -> str:
+        async with httpx.AsyncClient(
+            base_url="https://example.databricks.com", transport=transport
+        ) as client:
+            return await launch_or_reuse_daemon_runner(
+                client,
+                host_id="host_1",
+                session_id="conv_x",
+                workspace="/w",
+                fresh=fresh,
+            )
+
+    return asyncio.run(_drive())
+
+
+def test_daemon_fresh_launch_applies_policies_across_asyncio_boundary() -> None:
+    """A brand-new daemon launch POSTs the primed policies before launching."""
+    prime_session_policies([_spec("budget", "pkg.module.handler", None)])
+    requests: list[tuple[str, bytes]] = []
+    transport = _daemon_handler(requests, bound_runner=None, runner_online=False)
+
+    runner_id = _run_launch(transport, fresh=True)
+
+    assert runner_id == "runner_fresh"
+    methods = [(m, p) for (m, p) in requests]
+    assert ("POST", b"/v1/sessions/conv_x/policies") in methods
+    # Policy POST precedes the runner launch (atomic bind ordering).
+    assert methods.index(("POST", b"/v1/sessions/conv_x/policies")) < methods.index(
+        ("POST", b"/v1/hosts/host_1/runners")
+    )
+
+
+def test_daemon_cold_resume_applies_policies() -> None:
+    """Resuming a session with no live runner reaches the apply hook and POSTs."""
+    prime_session_policies([_spec("budget", "pkg.module.handler", None)])
+    requests: list[tuple[str, bytes]] = []
+    # No bound runner → cold resume → fresh launch path → policies applied.
+    transport = _daemon_handler(requests, bound_runner=None, runner_online=False)
+
+    runner_id = _run_launch(transport, fresh=False)
+
+    assert runner_id == "runner_fresh"
+    assert ("POST", b"/v1/sessions/conv_x/policies") in requests
+
+
+def test_daemon_live_reattach_skips_apply_and_guard_fails() -> None:
+    """Reusing an online runner (live reattach) applies nothing; the guard fails."""
+    prime_session_policies([_spec("budget", "pkg.module.handler", None)])
+    requests: list[tuple[str, bytes]] = []
+    # Session already bound to an ONLINE runner → reuse early-return, no launch.
+    transport = _daemon_handler(requests, bound_runner="runner_live", runner_online=True)
+
+    runner_id = _run_launch(transport, fresh=False)
+
+    assert runner_id == "runner_live"
+    # No policy POST happened — the online-runner reuse returned early.
+    assert all(not p.endswith(b"/policies") for (_m, p) in requests)
+    # Policies remain pending, so the launcher's handoff guard fails clearly.
+    with pytest.raises(click.ClickException, match="already running"):
+        ensure_session_policies_applied()
 
 
 # --- real native command wiring (option parsing on `omnigent pi`) ----------

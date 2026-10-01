@@ -87,12 +87,15 @@ async def bind_session_runner(
     """
     Bind a native terminal session to the runner that will host it.
 
-    This is the one server-side setup step every ``omnigent <harness>``
-    launcher runs with the resolved session id before the agent starts, so
-    it is also where any ``--policy-config`` policies primed for this launch
-    are attached to the session (a no-op when the flag is absent). Reattaches
-    to an already-running terminal skip this step — consistent with policy
-    changes not applying mid-session.
+    Launchers that bind through this helper (rather than the daemon's
+    ``launch_or_reuse_daemon_runner``) get any ``--policy-config`` policies
+    primed for this launch attached here, a no-op when the flag is absent.
+    Policies are POSTed BEFORE the runner-bind PATCH so the server never
+    exposes a bound runner lacking its requested policies: a rejected policy
+    aborts the launch here, with nothing bound. Applying is idempotent and
+    consumes the pending policies, so a launch that already attached them via
+    the daemon path binds without re-POSTing. A live-terminal reattach skips
+    binding entirely and fails earlier, at the launcher's handoff guard.
 
     :param client: HTTP client pointed at the Omnigent server.
     :param session_id: Session/conversation id, e.g.
@@ -100,8 +103,20 @@ async def bind_session_runner(
     :param runner_id: Registered runner id, e.g.
         ``"runner_abc123"``.
     :returns: None.
-    :raises click.ClickException: If binding fails.
+    :raises click.ClickException: If applying a policy or binding fails.
     """
+    # Attach session-scoped `--policy-config` policies (if any) BEFORE binding
+    # the runner, so a policy failure aborts with nothing bound and the server
+    # never sees a bound runner missing its policies. Imported lazily to keep
+    # this leaf helper's import cost (and dependency direction) minimal.
+    from omnigent.native.session_policy_config import apply_pending_session_policies
+
+    await apply_pending_session_policies(
+        client,
+        session_id,
+        notify=lambda message: click.echo(message, err=True),
+    )
+
     try:
         resp = await client.patch(
             f"/v1/sessions/{url_component(session_id)}",
@@ -138,14 +153,3 @@ async def bind_session_runner(
         raise click.ClickException(
             f"Native terminal session runner bind failed ({resp.status_code}): {error_text(resp)}"
         )
-
-    # Attach session-scoped `--policy-config` policies (if any) now that the
-    # session exists and before its terminal/agent starts. Imported lazily to
-    # keep this leaf helper's import cost (and dependency direction) minimal.
-    from omnigent.native.session_policy_config import apply_pending_session_policies
-
-    await apply_pending_session_policies(
-        client,
-        session_id,
-        notify=lambda message: click.echo(message, err=True),
-    )
