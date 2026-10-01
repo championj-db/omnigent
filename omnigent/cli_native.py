@@ -42,6 +42,11 @@ from omnigent.cli_common import (
 # launcher/runner imports to CLI startup.
 from omnigent.harnesses.devin_native.bridge import DEVIN_EFFORTS, DEVIN_PERMISSION_MODES
 
+# Shared ``--policy-config`` option. Importing it here only pulls in a leaf
+# module (click + contextvars); the YAML/spec load it performs is lazy, inside
+# the option callback, so this adds no launcher import cost at CLI startup.
+from omnigent.native.session_policy_config import policy_config_option
+
 _Args = ParamSpec("_Args")
 _Return = TypeVar("_Return")
 
@@ -183,6 +188,7 @@ def register_native_commands(cli: click.Group) -> None:
             "you type in the TUI is what gets routed, so this takes no -p."
         ),
     )
+    @policy_config_option
     @click.argument("claude_args", nargs=-1, type=click.UNPROCESSED)
     @observe_native_startup("claude-native")
     def claude(
@@ -366,6 +372,7 @@ def register_native_commands(cli: click.Group) -> None:
             "you type in the TUI is what gets routed, so this takes no -p."
         ),
     )
+    @policy_config_option
     @click.argument("codex_args", nargs=-1, type=click.UNPROCESSED)
     @observe_native_startup("codex-native")
     def codex(
@@ -395,6 +402,7 @@ def register_native_commands(cli: click.Group) -> None:
           omnigent codex --resume                  # interactive picker
           omnigent codex --server https://<app>.databricksapps.com
           omnigent codex --smart-routing           # first message picks the model
+          omnigent codex --policy-config policies.yaml   # session-scoped policy
         """
         _reject_native_on_windows("codex")
         if smart_routing:
@@ -495,6 +503,7 @@ def register_native_commands(cli: click.Group) -> None:
         help="Deprecated alias for ``--resume <id>``; kept for one release.",
     )
     @click.option("--model", default=None, help="OpenCode model to use for the native session.")
+    @policy_config_option
     @click.argument("opencode_args", nargs=-1, type=click.UNPROCESSED)
     def opencode(
         server: str | None,
@@ -597,6 +606,7 @@ def register_native_commands(cli: click.Group) -> None:
         hidden=True,
         help="Deprecated alias for ``--resume <id>``; kept for one release.",
     )
+    @policy_config_option
     @click.argument("pi_args", nargs=-1, type=click.UNPROCESSED)
     def pi(
         server: str | None,
@@ -612,6 +622,8 @@ def register_native_commands(cli: click.Group) -> None:
           omnigent pi --resume conv_abc123
           omnigent pi --resume                    # interactive picker
           omnigent pi --model local-deepseek/deepseek-v4-flash
+          omnigent pi --policy-config policies.yaml           # session-scoped policy
+          omnigent pi --resume conv_abc123 --policy-config policies.yaml
         """
         choice = _split_resume_value(resume)
         if session_id is not None and (choice.picker or choice.conversation_id is not None):
@@ -702,6 +714,7 @@ def register_native_commands(cli: click.Group) -> None:
         default=None,
         help="Cursor model id to use for the native TUI.",
     )
+    @policy_config_option
     @click.argument("cursor_args", nargs=-1, type=click.UNPROCESSED)
     def cursor(
         server: str | None,
@@ -841,6 +854,7 @@ def register_native_commands(cli: click.Group) -> None:
         default=None,
         help="Send this as the initial Devin chat input when the TUI starts.",
     )
+    @policy_config_option
     @click.argument("devin_args", nargs=-1, type=click.UNPROCESSED)
     def devin(
         server: str | None,
@@ -966,6 +980,7 @@ def register_native_commands(cli: click.Group) -> None:
         default=None,
         help="Send this as the initial Kiro chat input when the TUI starts.",
     )
+    @policy_config_option
     @click.argument("kiro_args", nargs=-1, type=click.UNPROCESSED)
     def kiro(
         server: str | None,
@@ -1072,6 +1087,7 @@ def register_native_commands(cli: click.Group) -> None:
         hidden=True,
         help="Deprecated alias for ``--resume <id>``; kept for one release.",
     )
+    @policy_config_option
     @click.argument("goose_args", nargs=-1, type=click.UNPROCESSED)
     def goose(
         server: str | None,
@@ -1159,6 +1175,7 @@ def register_native_commands(cli: click.Group) -> None:
         hidden=True,
         help="Deprecated alias for ``--resume <id>``; kept for one release.",
     )
+    @policy_config_option
     @click.argument("hermes_args", nargs=-1, type=click.UNPROCESSED)
     def hermes(
         server: str | None,
@@ -1247,6 +1264,7 @@ def register_native_commands(cli: click.Group) -> None:
         help="Deprecated alias for ``--resume <id>``; kept for one release.",
     )
     @click.option("--model", default=None, help="Antigravity (agy) model to use for the session.")
+    @policy_config_option
     @click.argument("antigravity_args", nargs=-1, type=click.UNPROCESSED)
     def antigravity(
         server: str | None,
@@ -1350,6 +1368,7 @@ def register_native_commands(cli: click.Group) -> None:
         hidden=True,
         help="Deprecated alias for ``--resume <id>``; kept for one release.",
     )
+    @policy_config_option
     @click.argument("qwen_args", nargs=-1, type=click.UNPROCESSED)
     def qwen(
         server: str | None,
@@ -1437,6 +1456,7 @@ def register_native_commands(cli: click.Group) -> None:
         hidden=True,
         help="Deprecated alias for ``--resume <id>``; kept for one release.",
     )
+    @policy_config_option
     @click.argument("kimi_args", nargs=-1, type=click.UNPROCESSED)
     def kimi(
         server: str | None,

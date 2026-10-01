@@ -87,6 +87,13 @@ async def bind_session_runner(
     """
     Bind a native terminal session to the runner that will host it.
 
+    This is the one server-side setup step every ``omnigent <harness>``
+    launcher runs with the resolved session id before the agent starts, so
+    it is also where any ``--policy-config`` policies primed for this launch
+    are attached to the session (a no-op when the flag is absent). Reattaches
+    to an already-running terminal skip this step — consistent with policy
+    changes not applying mid-session.
+
     :param client: HTTP client pointed at the Omnigent server.
     :param session_id: Session/conversation id, e.g.
         ``"conv_abc123"``.
@@ -131,3 +138,14 @@ async def bind_session_runner(
         raise click.ClickException(
             f"Native terminal session runner bind failed ({resp.status_code}): {error_text(resp)}"
         )
+
+    # Attach session-scoped `--policy-config` policies (if any) now that the
+    # session exists and before its terminal/agent starts. Imported lazily to
+    # keep this leaf helper's import cost (and dependency direction) minimal.
+    from omnigent.native.session_policy_config import apply_pending_session_policies
+
+    await apply_pending_session_policies(
+        client,
+        session_id,
+        notify=lambda message: click.echo(message, err=True),
+    )
