@@ -101,6 +101,7 @@ from omnigent.native.native_terminal import (
 from omnigent.native.native_terminal import (
     terminal_attach_url as _attach_url,
 )
+from omnigent.native.session_policy_config import ensure_session_policies_applied
 from omnigent.runtime.tool_result_replay import sanitize_replayed_image_blocks
 from omnigent.util.json_types import JsonObject as _JsonObject
 
@@ -734,6 +735,7 @@ def _run_with_local_server(
                 )
             if resolved_session_id is None:
                 _record_launch_for_fresh_session(prepared.session_id)
+            ensure_session_policies_applied()
             click.echo(f"Web UI: {conversation_url(base_url, prepared.session_id)}", err=True)
             open_conversation_link_if_enabled(
                 base_url=base_url,
@@ -835,6 +837,7 @@ def _run_with_remote_server(
                 )
             if resolved_session_id is None:
                 _record_launch_for_fresh_session(prepared.session_id)
+            ensure_session_policies_applied()
             click.echo(f"Web UI: {conversation_url(base_url, prepared.session_id)}", err=True)
             open_conversation_link_if_enabled(
                 base_url=base_url,

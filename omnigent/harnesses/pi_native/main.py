@@ -46,6 +46,7 @@ from omnigent.native.native_terminal import (
     normalize_extra_args as _normalize_extra_args,
 )
 from omnigent.native.native_terminal import url_component
+from omnigent.native.session_policy_config import ensure_session_policies_applied
 from omnigent.util.json_types import JsonObject as _JsonObject
 
 _logger = logging.getLogger(__name__)
@@ -320,6 +321,7 @@ def _run_with_remote_server(
                     workspace=str(Path.cwd().resolve()),
                     startup_progress=progress,
                 )
+            ensure_session_policies_applied()
             click.echo(f"Web UI: {conversation_url(base_url, prepared.session_id)}", err=True)
             open_conversation_link_if_enabled(
                 base_url=base_url,

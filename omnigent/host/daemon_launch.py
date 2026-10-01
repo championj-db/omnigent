@@ -276,6 +276,21 @@ async def launch_or_reuse_daemon_runner(
             f"/v1/sessions/{url_component(session_id)}",
             json={"runner_id": ""},
         )
+    # We're about to bind a freshly-launched runner (an online-runner reuse
+    # above returned early), so this is a new or cold-resumed launch — the
+    # universal point across every native harness's daemon path. Attach any
+    # ``--policy-config`` policies BEFORE the launch POST atomically binds the
+    # runner, so a rejected policy aborts here with nothing bound and the
+    # server never exposes a bound runner lacking its policies. A no-op when
+    # the flag is absent. Imported lazily to avoid an import cycle (the policy
+    # helper imports ``error_text`` from this module).
+    from omnigent.native.session_policy_config import apply_pending_session_policies
+
+    await apply_pending_session_policies(
+        client,
+        session_id,
+        notify=lambda message: click.echo(message, err=True),
+    )
     # The host tunnel can be briefly absent from the server's in-memory
     # registry while it (re)connects — e.g. just after `omnigent host`
     # restarts, after a server restart/redeploy, or under a flapping tunnel.

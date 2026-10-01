@@ -87,14 +87,36 @@ async def bind_session_runner(
     """
     Bind a native terminal session to the runner that will host it.
 
+    Launchers that bind through this helper (rather than the daemon's
+    ``launch_or_reuse_daemon_runner``) get any ``--policy-config`` policies
+    primed for this launch attached here, a no-op when the flag is absent.
+    Policies are POSTed BEFORE the runner-bind PATCH so the server never
+    exposes a bound runner lacking its requested policies: a rejected policy
+    aborts the launch here, with nothing bound. Applying is idempotent and
+    consumes the pending policies, so a launch that already attached them via
+    the daemon path binds without re-POSTing. A live-terminal reattach skips
+    binding entirely and fails earlier, at the launcher's handoff guard.
+
     :param client: HTTP client pointed at the Omnigent server.
     :param session_id: Session/conversation id, e.g.
         ``"conv_abc123"``.
     :param runner_id: Registered runner id, e.g.
         ``"runner_abc123"``.
     :returns: None.
-    :raises click.ClickException: If binding fails.
+    :raises click.ClickException: If applying a policy or binding fails.
     """
+    # Attach session-scoped `--policy-config` policies (if any) BEFORE binding
+    # the runner, so a policy failure aborts with nothing bound and the server
+    # never sees a bound runner missing its policies. Imported lazily to keep
+    # this leaf helper's import cost (and dependency direction) minimal.
+    from omnigent.native.session_policy_config import apply_pending_session_policies
+
+    await apply_pending_session_policies(
+        client,
+        session_id,
+        notify=lambda message: click.echo(message, err=True),
+    )
+
     try:
         resp = await client.patch(
             f"/v1/sessions/{url_component(session_id)}",
