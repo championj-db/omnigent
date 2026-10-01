@@ -45,7 +45,7 @@ from enum import Enum
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import FrameType
-from typing import TYPE_CHECKING, Any, Protocol, TextIO, TypeAlias, cast
+from typing import TYPE_CHECKING, Any, Literal, Protocol, TextIO, TypeAlias, cast
 from urllib.parse import urlparse
 
 if TYPE_CHECKING:
@@ -143,6 +143,7 @@ from omnigent.native.native_terminal import (
 from omnigent.native.session_policy_config import (
     apply_pending_session_policies,
     ensure_session_policies_applied,
+    pending_session_policies,
 )
 from omnigent.process_logging import log_info_once
 from omnigent.terminals.ws_common import (
@@ -6289,27 +6290,96 @@ async def _attach_policy_config_for_resume(
     fresh-launch policy attach in ``launch_or_reuse_daemon_runner``, so the
     resume decision is made here from terminal liveness:
 
-    - terminal torn down / absent (e.g. after a ``-p`` one-shot) — the agent is
-      being restarted, a cold-ish resume, so attach the policies before the
+    - terminal AUTHORITATIVELY absent (e.g. after a ``-p`` one-shot) — the agent
+      is being restarted, a cold-ish resume, so attach the policies before the
       replacement terminal starts; and
-    - terminal still live — a true reattach, so leave the policies pending for
-      the launcher's hand-off guard to reject the mid-run change.
+    - terminal live, OR liveness uncertain — a (possibly) live reattach, so fail
+      closed: do not apply and do not relaunch; raise the shared live-reattach
+      error (changing a session's policy mid-run is out of scope).
 
-    A no-op when ``--policy-config`` was not supplied or when the policies were
-    already attached during a fresh-runner launch.
+    Fails closed on uncertainty so a transient server hiccup never spawns a
+    replacement terminal next to a genuinely live one.
+
+    A no-op (no network request, original code path unchanged) when
+    ``--policy-config`` was not supplied or when the policies were already
+    attached during a fresh-runner launch — the flag-absent contract.
 
     :param client: HTTP client pointed at the Omnigent server.
     :param session_id: Session/conversation id, e.g. ``"conv_abc123"``.
     :returns: None.
-    :raises click.ClickException: If the server rejects a policy.
+    :raises click.ClickException: If the server rejects a policy, or when the
+        terminal is (or may be) live — the live-reattach error.
     """
-    if await _find_running_claude_terminal(client, session_id) is not None:
+    # Flag-absent contract: do no new work (not even the liveness probe) when
+    # nothing is pending. MUST precede any HTTP request.
+    if not pending_session_policies():
         return
-    await apply_pending_session_policies(
-        client,
-        session_id,
-        notify=lambda message: click.echo(message, err=True),
-    )
+    liveness = await _claude_terminal_liveness(client, session_id)
+    if liveness == "absent":
+        # Authoritative not-found → the terminal was torn down → restart path.
+        await apply_pending_session_policies(
+            client,
+            session_id,
+            notify=lambda message: click.echo(message, err=True),
+        )
+        return
+    # "live" or "unknown" → fail closed. Policies are still pending, so the
+    # shared guard raises the identical live-reattach error (and consumes them).
+    ensure_session_policies_applied()
+
+
+async def _claude_terminal_liveness(
+    client: httpx.AsyncClient,
+    session_id: str,
+) -> Literal["live", "absent", "unknown"]:
+    """Probe the claude terminal's liveness for the policy-attach decision.
+
+    A fail-closed sibling of :func:`_find_running_claude_terminal`, kept
+    separate so that function's ``str | None`` contract (relied on by the
+    reattach-vs-relaunch callers) is undisturbed. Only an AUTHORITATIVE
+    not-found permits the apply+relaunch path; everything else is treated as
+    "may be live":
+
+    - ``"live"`` — a 200 terminal resource that is not explicitly stopped.
+    - ``"absent"`` — an authoritative not-found: HTTP 404, or a 200 whose
+      metadata says ``running is False``.
+    - ``"unknown"`` — any ambiguous/transient outcome: timeout, connection
+      error, HTTP 409, any 5xx, an unexpected 200 shape, or any other non-404
+      status. The caller must fail closed on this.
+
+    :param client: HTTP client pointed at the Omnigent server.
+    :param session_id: Session/conversation id, e.g. ``"conv_abc123"``.
+    :returns: The three-state liveness verdict.
+    """
+    terminal_id = claude_terminal_resource_id()
+    try:
+        resp = await client.get(
+            (
+                f"/v1/sessions/{url_component(session_id)}"
+                f"/resources/terminals/{url_component(terminal_id)}"
+            ),
+            timeout=30.0,
+        )
+    except httpx.TransportError:
+        # Base of TimeoutException + connection/read errors: never reached a
+        # verdict (timeout / connection reset / DNS) → may be live.
+        return "unknown"
+    if resp.status_code == 200:
+        try:
+            payload = resp.json()
+        except ValueError:
+            return "unknown"
+        if payload.get("id") != terminal_id or payload.get("type") != "terminal":
+            # Unexpected shape — cannot conclude absence.
+            return "unknown"
+        metadata = payload.get("metadata")
+        if isinstance(metadata, dict) and metadata.get("running") is False:
+            return "absent"
+        return "live"
+    if resp.status_code == 404:
+        return "absent"
+    # 409, 5xx, and any other non-404 status are not authoritative not-founds.
+    return "unknown"
 
 
 async def _find_running_claude_terminal(

@@ -570,18 +570,29 @@ def test_applied_state_survives_asyncio_run_boundary() -> None:
     ensure_session_policies_applied()
 
 
-# --- claude -p one-shot resume: runner online but terminal torn down (B2) ---
+# --- claude daemon resume: online runner, terminal liveness decision ---------
+#
+# Claude's daemon path reuses an online runner without the fresh-launch policy
+# attach, so ``_attach_policy_config_for_resume`` decides from terminal liveness
+# and must FAIL CLOSED on any non-authoritative outcome (B1), and do NO work
+# when the flag is absent (B2).
 
 
 def _claude_resume_handler(
     requests: list[tuple[str, bytes]],
     *,
-    terminal_live: bool,
+    terminal_status: int = 200,
+    terminal_running: bool | None = True,
+    terminal_exc: type[httpx.TransportError] | None = None,
 ) -> httpx.MockTransport:
-    """Build a transport for ``_attach_policy_config_for_resume``.
+    """Build a transport driving the claude terminal-liveness GET + policy POST.
 
     :param requests: Sink of ``(method, raw_path)`` per request.
-    :param terminal_live: Whether the claude terminal resource is still running.
+    :param terminal_status: Status for the terminal GET (200/404/409/5xx/...).
+    :param terminal_running: For a 200, the ``metadata.running`` value; ``None``
+        omits the metadata entirely (shape = live-but-unspecified).
+    :param terminal_exc: When set, the terminal GET raises this transport error
+        (timeout / connection error) instead of returning a response.
     :returns: A configured :class:`httpx.MockTransport`.
     """
     from omnigent.harnesses.claude_native.main import claude_terminal_resource_id
@@ -592,12 +603,14 @@ def _claude_resume_handler(
         """Answer the terminal-liveness GET and the policy POST."""
         requests.append((request.method, request.url.raw_path))
         if "/resources/terminals/" in request.url.path:
-            if terminal_live:
-                return httpx.Response(
-                    200,
-                    json={"id": terminal_id, "type": "terminal", "metadata": {"running": True}},
-                )
-            return httpx.Response(404, json={})  # torn down (e.g. after `-p`)
+            if terminal_exc is not None:
+                raise terminal_exc("boom", request=request)
+            if terminal_status == 200:
+                body: dict[str, object] = {"id": terminal_id, "type": "terminal"}
+                if terminal_running is not None:
+                    body["metadata"] = {"running": terminal_running}
+                return httpx.Response(200, json=body)
+            return httpx.Response(terminal_status, json={"detail": "x"}, request=request)
         if request.url.path.endswith("/policies"):
             return httpx.Response(200, json={"id": "pol_x"})
         return httpx.Response(200, json={})
@@ -622,31 +635,88 @@ def _run_claude_resume(transport: httpx.MockTransport) -> None:
     asyncio.run(_drive())
 
 
-def test_claude_resume_dead_terminal_applies_and_passes_guard() -> None:
-    """`claude -p` then `--resume --policy-config`: policy applied; guard passes."""
+def test_claude_resume_absent_terminal_applies_and_passes_guard() -> None:
+    """(a) 404 (torn-down) terminal → policy applied; hand-off guard passes."""
     prime_session_policies([_spec("budget", "pkg.module.handler", None)])
     requests: list[tuple[str, bytes]] = []
 
-    _run_claude_resume(_claude_resume_handler(requests, terminal_live=False))
+    _run_claude_resume(_claude_resume_handler(requests, terminal_status=404))
 
-    # The torn-down terminal is a restart → policy IS applied before relaunch.
+    # Authoritative not-found → restart → policy IS applied before relaunch.
     assert ("POST", b"/v1/sessions/conv_x/policies") in requests
     # Applied → the synchronous hand-off guard does not raise.
     ensure_session_policies_applied()
 
 
-def test_claude_resume_live_terminal_defers_to_guard() -> None:
-    """A genuinely live terminal reattach applies nothing; the guard rejects."""
+def test_claude_resume_stopped_terminal_applies() -> None:
+    """A 200 with ``running=False`` is authoritative absent → policy applied."""
     prime_session_policies([_spec("budget", "pkg.module.handler", None)])
     requests: list[tuple[str, bytes]] = []
 
-    _run_claude_resume(_claude_resume_handler(requests, terminal_live=True))
+    _run_claude_resume(_claude_resume_handler(requests, terminal_running=False))
 
-    # Live terminal → true reattach → no policy POST.
-    assert all(not p.endswith(b"/policies") for (_m, p) in requests)
-    # Policies remain pending → the hand-off guard rejects the mid-run change.
+    assert ("POST", b"/v1/sessions/conv_x/policies") in requests
+    ensure_session_policies_applied()
+
+
+def test_claude_resume_live_terminal_fails_closed() -> None:
+    """A genuinely live terminal (200 running) applies nothing and raises."""
+    prime_session_policies([_spec("budget", "pkg.module.handler", None)])
+    requests: list[tuple[str, bytes]] = []
+
     with pytest.raises(click.ClickException, match="already running"):
-        ensure_session_policies_applied()
+        _run_claude_resume(_claude_resume_handler(requests, terminal_running=True))
+
+    assert all(not p.endswith(b"/policies") for (_m, p) in requests)
+    assert pending_session_policies() == ()  # consumed on raise
+
+
+@pytest.mark.parametrize("status", [500, 502, 503])
+def test_claude_resume_server_error_fails_closed(status: int) -> None:
+    """(b) A 5xx while probing a maybe-live terminal fails closed — no relaunch."""
+    prime_session_policies([_spec("budget", "pkg.module.handler", None)])
+    requests: list[tuple[str, bytes]] = []
+
+    with pytest.raises(click.ClickException, match="already running"):
+        _run_claude_resume(_claude_resume_handler(requests, terminal_status=status))
+
+    assert all(not p.endswith(b"/policies") for (_m, p) in requests)
+
+
+@pytest.mark.parametrize("exc", [httpx.ReadTimeout, httpx.ConnectTimeout, httpx.ConnectError])
+def test_claude_resume_transport_error_fails_closed(exc: type[httpx.TransportError]) -> None:
+    """(c) A timeout / connection error fails closed — no apply, raises."""
+    prime_session_policies([_spec("budget", "pkg.module.handler", None)])
+    requests: list[tuple[str, bytes]] = []
+
+    with pytest.raises(click.ClickException, match="already running"):
+        _run_claude_resume(_claude_resume_handler(requests, terminal_exc=exc))
+
+    assert all(not p.endswith(b"/policies") for (_m, p) in requests)
+
+
+@pytest.mark.parametrize("status", [409, 418])
+def test_claude_resume_non_404_status_fails_closed(status: int) -> None:
+    """(d) 409 / other non-404 status is not authoritative absent → fail closed."""
+    prime_session_policies([_spec("budget", "pkg.module.handler", None)])
+    requests: list[tuple[str, bytes]] = []
+
+    with pytest.raises(click.ClickException, match="already running"):
+        _run_claude_resume(_claude_resume_handler(requests, terminal_status=status))
+
+    assert all(not p.endswith(b"/policies") for (_m, p) in requests)
+
+
+def test_claude_resume_without_policy_makes_no_request() -> None:
+    """B2: a policy-free claude resume issues NO liveness request (inert path)."""
+    prime_session_policies([])  # flag absent → nothing pending
+
+    def _boom(request: httpx.Request) -> httpx.Response:
+        """Fail if any HTTP request is attempted."""
+        raise AssertionError(f"unexpected request: {request.method} {request.url.path}")
+
+    # Must early-return before touching the transport; must not raise.
+    _run_claude_resume(httpx.MockTransport(_boom))
 
 
 # --- real native command wiring (option parsing on `omnigent pi`) ----------
