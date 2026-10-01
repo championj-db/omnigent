@@ -6369,6 +6369,10 @@ async def _claude_terminal_liveness(
             payload = resp.json()
         except ValueError:
             return "unknown"
+        if not isinstance(payload, dict):
+            # JSON-valid but non-object (``[]``, ``null``, a bare string) — an
+            # unexpected shape with no ``.get``; treat as ambiguous.
+            return "unknown"
         if payload.get("id") != terminal_id or payload.get("type") != "terminal":
             # Unexpected shape — cannot conclude absence.
             return "unknown"

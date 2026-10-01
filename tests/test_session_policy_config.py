@@ -48,6 +48,10 @@ _HARNESS_COMMANDS = (
     "opencode",
 )
 
+# Sentinel distinguishing "no body override" from an explicit JSON ``null``
+# body in ``_claude_resume_handler``.
+_UNSET = object()
+
 
 @pytest.fixture(autouse=True)
 def _reset_pending_policies() -> Iterator[None]:
@@ -584,6 +588,7 @@ def _claude_resume_handler(
     terminal_status: int = 200,
     terminal_running: bool | None = True,
     terminal_exc: type[httpx.TransportError] | None = None,
+    terminal_body: object = _UNSET,
 ) -> httpx.MockTransport:
     """Build a transport driving the claude terminal-liveness GET + policy POST.
 
@@ -593,6 +598,10 @@ def _claude_resume_handler(
         omits the metadata entirely (shape = live-but-unspecified).
     :param terminal_exc: When set, the terminal GET raises this transport error
         (timeout / connection error) instead of returning a response.
+    :param terminal_body: When provided (including ``None`` for a JSON ``null``),
+        used verbatim as the 200 GET body — lets a test return a JSON-valid but
+        non-object body (``[]``, ``null``, a bare string). Default builds the
+        normal terminal object.
     :returns: A configured :class:`httpx.MockTransport`.
     """
     from omnigent.harnesses.claude_native.main import claude_terminal_resource_id
@@ -606,6 +615,15 @@ def _claude_resume_handler(
             if terminal_exc is not None:
                 raise terminal_exc("boom", request=request)
             if terminal_status == 200:
+                if terminal_body is not _UNSET:
+                    # Serialize via ``content`` (not ``json=``) so a genuine JSON
+                    # ``null`` / ``[]`` / bare string body reaches ``resp.json()``
+                    # — ``httpx.Response(json=None)`` would send an empty body.
+                    return httpx.Response(
+                        200,
+                        content=json.dumps(terminal_body),
+                        headers={"content-type": "application/json"},
+                    )
                 body: dict[str, object] = {"id": terminal_id, "type": "terminal"}
                 if terminal_running is not None:
                     body["metadata"] = {"running": terminal_running}
@@ -703,6 +721,26 @@ def test_claude_resume_non_404_status_fails_closed(status: int) -> None:
 
     with pytest.raises(click.ClickException, match="already running"):
         _run_claude_resume(_claude_resume_handler(requests, terminal_status=status))
+
+    assert all(not p.endswith(b"/policies") for (_m, p) in requests)
+
+
+@pytest.mark.parametrize(
+    ("label", "body"),
+    [("list", []), ("null", None), ("string", "oops")],
+)
+def test_claude_resume_non_object_json_fails_closed(label: str, body: object) -> None:
+    """A JSON-valid but non-object 200 body is ambiguous → fail closed.
+
+    Such a body parses fine (so ``except ValueError`` does not catch it) yet has
+    no ``.get`` — the pre-fix probe raised AttributeError instead of the shared
+    live-reattach error.
+    """
+    prime_session_policies([_spec("budget", "pkg.module.handler", None)])
+    requests: list[tuple[str, bytes]] = []
+
+    with pytest.raises(click.ClickException, match="already running"):
+        _run_claude_resume(_claude_resume_handler(requests, terminal_body=body))
 
     assert all(not p.endswith(b"/policies") for (_m, p) in requests)
 
